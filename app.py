@@ -18,7 +18,7 @@ import yfinance as yf
 from supabase import create_client, Client
 
 APP_NAME = "G. Signal Tracker"
-APP_VERSION = "V1.9"
+APP_VERSION = "V2.0"
 BUCKET_NAME = "signal-screenshots"
 LOCAL_TZ = ZoneInfo("Europe/Rome")
 
@@ -861,8 +861,13 @@ def evaluate_trade(row: Dict[str, Any]) -> Dict[str, Optional[str]]:
     try:
         closes = df["Close"].dropna()
         if not closes.empty:
-            quote_ts = closes.index[-1]
-            _store_market_quote(str(row["ticker"]), float(closes.iloc[-1]), quote_ts, "Yahoo Finance")
+            # La freschezza della cache deve riferirsi al momento in cui abbiamo
+            # recuperato il dato, non all'orario della barra Yahoo. I futures
+            # possono essere ritardati: usando l'orario della barra la quote
+            # veniva subito considerata "scaduta" e Dashboard mostrava —.
+            market_ts = closes.index[-1]
+            source = f"Yahoo Finance · ultimo dato {market_ts}"
+            _store_market_quote(str(row["ticker"]), float(closes.iloc[-1]), local_now(), source)
     except Exception:
         pass
 
@@ -1302,7 +1307,7 @@ def dashboard_live_panel(auto_monitor: bool) -> None:
     if auto_monitor and can_write():
         st.caption(
             f"🟢 Monitoraggio automatico attivo · controllo ogni 60 secondi · ultimo controllo: {last_market_check_label(df)}. "
-            "Fonte Yahoo Finance: il dato può essere ritardato."
+            "Fonte Yahoo Finance: il prezzo mostrato è l’ultimo dato disponibile e può essere ritardato."
         )
     else:
         st.caption(f"Ultimo controllo mercato: {last_market_check_label(df)}")
