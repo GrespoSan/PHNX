@@ -18,7 +18,7 @@ import yfinance as yf
 from supabase import create_client, Client
 
 APP_NAME = "G. Signal Tracker"
-APP_VERSION = "V2.4"
+APP_VERSION = "V2.5"
 BUCKET_NAME = "signal-screenshots"
 LOCAL_TZ = ZoneInfo("Europe/Rome")
 
@@ -1327,8 +1327,8 @@ def dashboard_live_panel(auto_monitor: bool) -> None:
         selection_mode="single-row",
     )
     st.markdown(
-        "<div style='font-weight:800; color:#ffb347; margin-top:0.10rem; margin-bottom:0.20rem;'>"
-        "SELEZIONA IL RIQUADRO A SINISTRA DELLA RIGA PER MOSTRARE I COMANDI MODIFICA E APRI GRAFICO ALLEGATO."
+        "<div style='font-weight:800; color:#ffb347; text-transform:uppercase; margin-top:0.20rem; margin-bottom:0.15rem;'>"
+        "⬆️ SELEZIONA IL RIQUADRO ☐ A SINISTRA DELLA RIGA PER MOSTRARE I COMANDI MODIFICA E APRI GRAFICO ALLEGATO."
         "</div>",
         unsafe_allow_html=True,
     )
