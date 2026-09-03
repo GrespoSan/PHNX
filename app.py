@@ -18,7 +18,7 @@ import yfinance as yf
 from supabase import create_client, Client
 
 APP_NAME = "G. Signal Tracker"
-APP_VERSION = "V2.5"
+APP_VERSION = "V2.7"
 BUCKET_NAME = "signal-screenshots"
 LOCAL_TZ = ZoneInfo("Europe/Rome")
 
@@ -1494,11 +1494,6 @@ def page_archive() -> None:
                 key=f"open_img_archive_{sid}",
             )
             edit_signal_panel(row, key_prefix="archive")
-            with st.expander("Dettaglio completo", expanded=False):
-                clean = {k: v for k, v in row.items() if k not in {"ocr_text", "created_by", "updated_by"}}
-                st.json(clean, expanded=False)
-                if row.get("ocr_text"):
-                    st.code(row["ocr_text"])
 
 
 def page_users() -> None:
@@ -1577,22 +1572,11 @@ def page_info() -> None:
         """
         **Principio operativo**
 
-        - **Contesto**: Balance / Punto di svolta / entrambi, con eventuali conferme facoltative.
+        - **Contesto**: Balance / Punto di svolta / Revolving Door, con eventuali conferme facoltative.
         - **Segnale originale**: E1/E2 e S1/S2 sono riferimenti indicativi definiti prima della giornata operativa.
         - **Trade reale**: Entry effettiva e Stop effettivo vengono registrati quando la dinamica del mercato dà l'ingresso.
         - **Nessun trade**: se non compare un ingresso valido, il segnale non viene classificato come perdita.
         - **Statistiche**: vengono separate la qualità dell'idea iniziale e l'efficacia dei trade realmente eseguiti.
-
-        **Persistenza e collaborazione**
-
-        Dalla V1.3 segnali e screenshot vengono conservati in **Supabase**. Un reboot o un nuovo deploy di Streamlit
-        non cancella più l'archivio. Gli utenti hanno ruoli separati: Amministratore, Collaboratore e Solo lettura.
-
-        **Dashboard operativa V1.9**
-
-        In Dashboard è disponibile il controllo automatico ogni 60 secondi dei trade aperti. Prezzo attuale e distanza dal target attivo sono mostrati sulla stessa riga. T1, T2 e Stop vengono
-        evidenziati visivamente quando risultano raggiunti. Selezionando una riga puoi modificare il segnale o aprire il grafico allegato senza una sezione separata di gestione trade. Il controllo usa dati Yahoo Finance e può quindi essere
-        ritardato: non è un feed tick-by-tick professionale.
         """
     )
 
