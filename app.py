@@ -18,7 +18,7 @@ import pytesseract
 import yfinance as yf
 
 APP_NAME = "G. Signal Tracker"
-APP_VERSION = "V1.0"
+APP_VERSION = "V1.1"
 DATA_DIR = Path("data")
 SCREENSHOT_DIR = DATA_DIR / "screenshots"
 DB_PATH = DATA_DIR / "signals.db"
@@ -162,7 +162,7 @@ def run_ocr(img: Image.Image) -> Tuple[str, str]:
     """Ritorna OCR completo + OCR fascia alta, utile per lo strumento TradingView."""
     if not configure_tesseract():
         raise RuntimeError(
-            "Tesseract OCR non trovato. In Streamlit Cloud usa packages.txt; in locale installa Tesseract-OCR."
+            "OCR non disponibile: su Streamlit Community Cloud serve anche il file packages.txt con la riga tesseract-ocr nel repository."
         )
 
     full = preprocess_for_ocr(img, scale=2, contrast=2.2)
@@ -945,14 +945,14 @@ with st.sidebar:
     st.markdown(f"### {APP_NAME}")
     page = st.radio(
         "Sezione",
-        ["Dashboard", "Nuovo segnale", "Gestione trade", "Statistiche", "Archivio", "Info"],
+        ["Dashboard", "Carica nuovo segnale", "Gestione trade", "Statistiche", "Archivio", "Info"],
     )
     st.divider()
     st.caption("E1/E2 = livelli indicativi. Il Win Rate operativo usa Entry e Stop reali.")
 
 if page == "Dashboard":
     page_dashboard()
-elif page == "Nuovo segnale":
+elif page == "Carica nuovo segnale":
     page_new_signal()
 elif page == "Gestione trade":
     page_manage()
