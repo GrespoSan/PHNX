@@ -18,7 +18,7 @@ import yfinance as yf
 from supabase import create_client, Client
 
 APP_NAME = "G. Signal Tracker"
-APP_VERSION = "V2.6"
+APP_VERSION = "V2.8"
 BUCKET_NAME = "signal-screenshots"
 LOCAL_TZ = ZoneInfo("Europe/Rome")
 
@@ -37,10 +37,23 @@ CONFIRMATIONS = [
     "Bollinger",
     "Supertrend",
     "Price Action",
+    "Divergenze",
+    "News",
     "Altro",
 ]
 
-SETUP_ORIGINS = ["—", "Revolving Door", "Balance", "Punto di svolta", "Balance + Punto di svolta", "Altro"]
+SETUP_ORIGINS = [
+    "—",
+    "Revolving Door",
+    "Balance",
+    "Punto di svolta",
+    "Balance + Punto di svolta",
+    "Massimo e minimo Settimanale",
+    "Massimo e minimo Mensile",
+    "Massimo e minimo Trimestrale",
+    "Massimo e minimo Annuale",
+    "Altro",
+]
 TIMEFRAMES = ["—", "15m", "30m", "1H", "2H", "4H", "Daily", "Weekly", "Monthly", "Altro"]
 
 INSTRUMENT_ALIASES = {
