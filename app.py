@@ -18,7 +18,7 @@ import yfinance as yf
 from supabase import create_client, Client
 
 APP_NAME = "G. Signal Tracker"
-APP_VERSION = "V2.1"
+APP_VERSION = "V2.3"
 BUCKET_NAME = "signal-screenshots"
 LOCAL_TZ = ZoneInfo("Europe/Rome")
 
@@ -1326,10 +1326,13 @@ def dashboard_live_panel(auto_monitor: bool) -> None:
         on_select="rerun",
         selection_mode="single-row",
     )
-    st.caption(
-        "Per i trade aperti: prima di T1 viene mostrata la distanza da T1; dopo T1 la distanza da T2. "
-        "T1/T2 diventano verdi quando raggiunti; lo Stop reale diventa rosso se colpito. Seleziona una riga per modificarla o aprire il grafico allegato."
+    st.markdown(
+        "<div style='font-weight:800; color:#ffb347; text-transform:uppercase; margin-top:0.20rem; margin-bottom:0.15rem;'>"
+        "⬆️ SELEZIONA UNA RIGA DELLA TABELLA PER MOSTRARE I COMANDI MODIFICA E APRI GRAFICO ALLEGATO."
+        "</div>",
+        unsafe_allow_html=True,
     )
+    st.caption("E1/E2 = livelli indicativi. Il Win Rate operativo usa Entry e Stop reali.")
 
     selected_rows = []
     try:
@@ -1370,9 +1373,6 @@ def dashboard_live_panel(auto_monitor: bool) -> None:
                         selected_raw.get("screenshot_path") or "",
                         f"Segnale #{sid} · {selected_raw.get('instrument','')} · {selected_raw.get('direction','')} · {selected_raw.get('valid_date','')}",
                     )
-    else:
-        st.caption("⬆️ Seleziona una riga della tabella per mostrare i comandi Modifica e Apri grafico allegato.")
-
     st.download_button(
         "⬇️ Esporta storico Excel", data=excel_bytes(df),
         file_name=f"signal_tracker_{local_now().date().isoformat()}.xlsx",
@@ -1636,7 +1636,6 @@ with st.sidebar:
 
     page = st.radio("Sezione", pages)
     st.divider()
-    st.caption("E1/E2 = livelli indicativi. Il Win Rate operativo usa Entry e Stop reali.")
     change_password_box()
     if st.button("🚪 Esci", use_container_width=True):
         try:
