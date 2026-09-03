@@ -18,7 +18,7 @@ import yfinance as yf
 from supabase import create_client, Client
 
 APP_NAME = "G. Signal Tracker"
-APP_VERSION = "V1.8"
+APP_VERSION = "V1.9"
 BUCKET_NAME = "signal-screenshots"
 LOCAL_TZ = ZoneInfo("Europe/Rome")
 
@@ -485,137 +485,139 @@ def _num_changed(old: Any, new: Optional[float]) -> bool:
         return str(old) != str(new)
 
 
-def edit_signal_panel(row: Dict[str, Any], key_prefix: str) -> None:
-    """Permette di correggere anche dopo il salvataggio segnale, contesto e trade reale."""
+def _edit_signal_body(row: Dict[str, Any], key_prefix: str) -> None:
+    """Correzione completa del segnale; dalla Dashboard consente anche di registrare il trade reale."""
     if not can_write():
+        st.warning("Il tuo profilo è in sola lettura.")
         return
 
     sid = int(row["id"])
     current_conf = confirmations_list(row.get("confirmations"))
-    current_entry_dt = _local_datetime_from_db(row.get("entry_time"))
-    has_real_trade = row.get("actual_entry") is not None or row.get("entry_time")
+    has_real_trade = row.get("actual_entry") is not None or bool(row.get("entry_time"))
+    current_entry_dt = _local_datetime_from_db(row.get("entry_time")) if has_real_trade else local_now()
 
-    with st.expander("✏️ Modifica dati segnale", expanded=False):
-        st.caption(
-            "Puoi correggere anche dopo il salvataggio origine, Balance/punto di svolta, conferme, livelli e note. "
-            "Se modifichi dati che influenzano un trade già attivo, il monitoraggio viene ricalcolato."
+    st.caption(
+        "Puoi correggere segnale, origine, conferme, livelli e note. "
+        "Da qui puoi anche registrare Entry e Stop reali quando il setup diventa operativo."
+    )
+
+    with st.form(f"{key_prefix}_edit_signal_{sid}"):
+        st.markdown("#### Segnale originale")
+        c1, c2, c3 = st.columns(3)
+        try:
+            current_date = date.fromisoformat(str(row.get("valid_date")))
+        except Exception:
+            current_date = local_now().date()
+        valid_date_edit = c1.date_input("Data di validità", value=current_date, key=f"{key_prefix}_date_{sid}")
+        instrument_edit = c2.text_input("Strumento", value=str(row.get("instrument") or ""), key=f"{key_prefix}_instr_{sid}")
+        direction_edit = c3.selectbox(
+            "Direzione", ["LONG", "SHORT"],
+            index=_option_index(["LONG", "SHORT"], row.get("direction")),
+            key=f"{key_prefix}_dir_{sid}",
         )
-        with st.form(f"{key_prefix}_edit_signal_{sid}"):
-            st.markdown("#### Segnale originale")
-            c1, c2, c3 = st.columns(3)
-            try:
-                current_date = date.fromisoformat(str(row.get("valid_date")))
-            except Exception:
-                current_date = local_now().date()
-            valid_date_edit = c1.date_input("Data di validità", value=current_date, key=f"{key_prefix}_date_{sid}")
-            instrument_edit = c2.text_input("Strumento", value=str(row.get("instrument") or ""), key=f"{key_prefix}_instr_{sid}")
-            direction_edit = c3.selectbox(
-                "Direzione", ["LONG", "SHORT"],
-                index=_option_index(["LONG", "SHORT"], row.get("direction")),
-                key=f"{key_prefix}_dir_{sid}",
-            )
-            ticker_edit = st.text_input(
-                "Ticker Yahoo Finance", value=str(row.get("ticker") or ""), key=f"{key_prefix}_ticker_{sid}"
-            )
+        ticker_edit = st.text_input(
+            "Ticker Yahoo Finance", value=str(row.get("ticker") or ""), key=f"{key_prefix}_ticker_{sid}"
+        )
 
-            a1, a2, a3, a4 = st.columns(4)
-            e1_edit = normalize_number(a1.text_input("E1 indicativa", fmt_num(row.get("e1")), key=f"{key_prefix}_e1_{sid}"))
-            s1_edit = normalize_number(a2.text_input("S1 indicativo", fmt_num(row.get("s1")), key=f"{key_prefix}_s1_{sid}"))
-            e2_edit = normalize_number(a3.text_input("E2 indicativa", fmt_num(row.get("e2")), key=f"{key_prefix}_e2_{sid}"))
-            s2_edit = normalize_number(a4.text_input("S2 indicativo", fmt_num(row.get("s2")), key=f"{key_prefix}_s2_{sid}"))
-            b1, b2 = st.columns(2)
-            t1_edit = normalize_number(b1.text_input("T1", fmt_num(row.get("t1")), key=f"{key_prefix}_t1_{sid}"))
-            t2_edit = normalize_number(b2.text_input("T2", fmt_num(row.get("t2")), key=f"{key_prefix}_t2_{sid}"))
+        a1, a2, a3, a4 = st.columns(4)
+        e1_edit = normalize_number(a1.text_input("E1 indicativa", fmt_num(row.get("e1")), key=f"{key_prefix}_e1_{sid}"))
+        s1_edit = normalize_number(a2.text_input("S1 indicativo", fmt_num(row.get("s1")), key=f"{key_prefix}_s1_{sid}"))
+        e2_edit = normalize_number(a3.text_input("E2 indicativa", fmt_num(row.get("e2")), key=f"{key_prefix}_e2_{sid}"))
+        s2_edit = normalize_number(a4.text_input("S2 indicativo", fmt_num(row.get("s2")), key=f"{key_prefix}_s2_{sid}"))
+        b1, b2 = st.columns(2)
+        t1_edit = normalize_number(b1.text_input("T1", fmt_num(row.get("t1")), key=f"{key_prefix}_t1_{sid}"))
+        t2_edit = normalize_number(b2.text_input("T2", fmt_num(row.get("t2")), key=f"{key_prefix}_t2_{sid}"))
 
-            st.markdown("#### Contesto del setup")
-            c1, c2, c3 = st.columns(3)
-            setup_origin_edit = c1.selectbox(
-                "Origine del setup", SETUP_ORIGINS,
-                index=_option_index(SETUP_ORIGINS, row.get("setup_origin")),
-                key=f"{key_prefix}_origin_{sid}",
-            )
-            reference_area_edit = c2.text_input(
-                "Livello / area Balance o svolta", value=str(row.get("reference_area") or ""),
-                key=f"{key_prefix}_reference_{sid}",
-            )
-            setup_tf_edit = c3.selectbox(
-                "Timeframe del riferimento", TIMEFRAMES,
-                index=_option_index(TIMEFRAMES, row.get("setup_timeframe")),
-                key=f"{key_prefix}_tf_{sid}",
-            )
+        st.markdown("#### Contesto del setup")
+        c1, c2, c3 = st.columns(3)
+        setup_origin_edit = c1.selectbox(
+            "Origine del setup", SETUP_ORIGINS,
+            index=_option_index(SETUP_ORIGINS, row.get("setup_origin")),
+            key=f"{key_prefix}_origin_{sid}",
+        )
+        reference_area_edit = c2.text_input(
+            "Livello / area Balance o svolta", value=str(row.get("reference_area") or ""),
+            key=f"{key_prefix}_reference_{sid}",
+        )
+        setup_tf_edit = c3.selectbox(
+            "Timeframe del riferimento", TIMEFRAMES,
+            index=_option_index(TIMEFRAMES, row.get("setup_timeframe")),
+            key=f"{key_prefix}_tf_{sid}",
+        )
 
-            st.markdown("**Conferme osservate — facoltative**")
-            conf_cols = st.columns(4)
-            confirmations_edit: List[str] = []
-            for i, name in enumerate(CONFIRMATIONS):
-                checked = conf_cols[i % 4].checkbox(
-                    name, value=name in current_conf, key=f"{key_prefix}_conf_{sid}_{i}"
-                )
-                if checked:
-                    confirmations_edit.append(name)
-            notes_edit = st.text_area(
-                "Note / motivazione del setup", value=str(row.get("notes") or ""),
-                key=f"{key_prefix}_notes_{sid}",
+        st.markdown("**Conferme osservate — facoltative**")
+        conf_cols = st.columns(4)
+        confirmations_edit: List[str] = []
+        for i, name in enumerate(CONFIRMATIONS):
+            checked = conf_cols[i % 4].checkbox(
+                name, value=name in current_conf, key=f"{key_prefix}_conf_{sid}_{i}"
             )
+            if checked:
+                confirmations_edit.append(name)
+        notes_edit = st.text_area(
+            "Note / motivazione del setup", value=str(row.get("notes") or ""),
+            key=f"{key_prefix}_notes_{sid}",
+        )
 
-            if has_real_trade:
-                st.markdown("#### Trade reale")
-                tc1, tc2 = st.columns(2)
-                actual_entry_edit = normalize_number(tc1.text_input(
-                    "Entry effettiva", fmt_num(row.get("actual_entry")), key=f"{key_prefix}_actual_entry_{sid}"
-                ))
-                actual_stop_edit = normalize_number(tc2.text_input(
-                    "Stop effettivo", fmt_num(row.get("actual_stop")), key=f"{key_prefix}_actual_stop_{sid}"
-                ))
-                td1, td2 = st.columns(2)
-                entry_date_edit = td1.date_input(
-                    "Data ingresso", value=current_entry_dt.date(), key=f"{key_prefix}_entry_date_{sid}"
-                )
-                entry_time_edit = td2.time_input(
-                    "Ora ingresso", value=current_entry_dt.time().replace(microsecond=0), key=f"{key_prefix}_entry_time_{sid}"
-                )
+        st.markdown("#### Trade reale")
+        if not has_real_trade:
+            st.caption("Lascia vuoti Entry e Stop finché non decidi di entrare. Quando li compili entrambi il trade passa automaticamente IN TRADE.")
+        tc1, tc2 = st.columns(2)
+        actual_entry_edit = normalize_number(tc1.text_input(
+            "Entry effettiva", fmt_num(row.get("actual_entry")), key=f"{key_prefix}_actual_entry_{sid}"
+        ))
+        actual_stop_edit = normalize_number(tc2.text_input(
+            "Stop effettivo", fmt_num(row.get("actual_stop")), key=f"{key_prefix}_actual_stop_{sid}"
+        ))
+        td1, td2 = st.columns(2)
+        entry_date_edit = td1.date_input(
+            "Data ingresso", value=current_entry_dt.date(), key=f"{key_prefix}_entry_date_{sid}"
+        )
+        entry_time_edit = td2.time_input(
+            "Ora ingresso", value=current_entry_dt.time().replace(microsecond=0), key=f"{key_prefix}_entry_time_{sid}"
+        )
+
+        save_edit = st.form_submit_button("💾 Salva modifiche", type="primary", use_container_width=True)
+
+    if save_edit:
+        errors: List[str] = []
+        if not instrument_edit.strip():
+            errors.append("strumento")
+        if t1_edit is None:
+            errors.append("T1")
+
+        trade_started_now = (not has_real_trade) and (actual_entry_edit is not None or actual_stop_edit is not None)
+        if (has_real_trade or trade_started_now) and (actual_entry_edit is None or actual_stop_edit is None):
+            errors.append("Entry/Stop reale")
+        if errors:
+            st.error("Campi necessari mancanti o non validi: " + ", ".join(errors))
+            return
+
+        updates: Dict[str, Any] = {
+            "valid_date": valid_date_edit.isoformat(),
+            "instrument": instrument_edit.strip(),
+            "ticker": ticker_edit.strip(),
+            "direction": direction_edit,
+            "e1": e1_edit, "s1": s1_edit, "e2": e2_edit, "s2": s2_edit,
+            "t1": t1_edit, "t2": t2_edit,
+            "setup_origin": setup_origin_edit,
+            "reference_area": reference_area_edit.strip(),
+            "setup_timeframe": setup_tf_edit,
+            "confirmations": confirmations_edit,
+            "notes": notes_edit.strip(),
+        }
+
+        monitoring_changed = False
+        if has_real_trade or trade_started_now:
+            new_entry_dt = datetime.combine(entry_date_edit, entry_time_edit, tzinfo=LOCAL_TZ)
+            updates.update({
+                "actual_entry": actual_entry_edit,
+                "actual_stop": actual_stop_edit,
+                "entry_time": new_entry_dt.isoformat(timespec="seconds"),
+            })
+            if not has_real_trade:
+                monitoring_changed = True
             else:
-                actual_entry_edit = row.get("actual_entry")
-                actual_stop_edit = row.get("actual_stop")
-                entry_date_edit = None
-                entry_time_edit = None
-
-            save_edit = st.form_submit_button("💾 Salva modifiche", type="primary", use_container_width=True)
-
-        if save_edit:
-            errors: List[str] = []
-            if not instrument_edit.strip():
-                errors.append("strumento")
-            if t1_edit is None:
-                errors.append("T1")
-            if has_real_trade and (actual_entry_edit is None or actual_stop_edit is None):
-                errors.append("Entry/Stop reale")
-            if errors:
-                st.error("Campi necessari mancanti o non validi: " + ", ".join(errors))
-                return
-
-            updates: Dict[str, Any] = {
-                "valid_date": valid_date_edit.isoformat(),
-                "instrument": instrument_edit.strip(),
-                "ticker": ticker_edit.strip(),
-                "direction": direction_edit,
-                "e1": e1_edit, "s1": s1_edit, "e2": e2_edit, "s2": s2_edit,
-                "t1": t1_edit, "t2": t2_edit,
-                "setup_origin": setup_origin_edit,
-                "reference_area": reference_area_edit.strip(),
-                "setup_timeframe": setup_tf_edit,
-                "confirmations": confirmations_edit,
-                "notes": notes_edit.strip(),
-            }
-
-            monitoring_changed = False
-            if has_real_trade:
-                new_entry_dt = datetime.combine(entry_date_edit, entry_time_edit, tzinfo=LOCAL_TZ)
-                updates.update({
-                    "actual_entry": actual_entry_edit,
-                    "actual_stop": actual_stop_edit,
-                    "entry_time": new_entry_dt.isoformat(timespec="seconds"),
-                })
                 old_entry_dt = _local_datetime_from_db(row.get("entry_time"))
                 monitoring_changed = (
                     _num_changed(row.get("actual_entry"), actual_entry_edit)
@@ -627,26 +629,57 @@ def edit_signal_panel(row: Dict[str, Any], key_prefix: str) -> None:
                     or old_entry_dt.replace(microsecond=0) != new_entry_dt.replace(microsecond=0)
                 )
 
-            if monitoring_changed:
-                updates.update({
-                    "status": "IN TRADE",
-                    "outcome": None,
-                    "t1_hit_time": None,
-                    "t2_hit_time": None,
-                    "stop_hit_time": None,
-                    "result_note": "Dati trade corretti manualmente; monitoraggio da ricalcolare",
-                    "last_check": None,
-                })
+        if monitoring_changed:
+            updates.update({
+                "status": "IN TRADE",
+                "outcome": None,
+                "t1_hit_time": None,
+                "t2_hit_time": None,
+                "stop_hit_time": None,
+                "result_note": "Ingresso/dati trade registrati o corretti; monitoraggio da ricalcolare",
+                "last_check": None,
+            })
 
-            try:
-                update_signal(sid, **updates)
-                if monitoring_changed:
-                    st.success("Modifiche salvate. Il monitoraggio del trade è stato azzerato e verrà ricalcolato con i nuovi dati.")
-                else:
-                    st.success("Modifiche salvate.")
-                st.rerun()
-            except Exception as e:
-                st.error(f"Modifica non riuscita: {e}")
+        try:
+            update_signal(sid, **updates)
+            if trade_started_now:
+                st.success("Ingresso reale registrato. Il trade è ora IN TRADE e verrà monitorato automaticamente.")
+            elif monitoring_changed:
+                st.success("Modifiche salvate. Il monitoraggio è stato azzerato e verrà ricalcolato con i nuovi dati.")
+            else:
+                st.success("Modifiche salvate.")
+            st.rerun()
+        except Exception as e:
+            st.error(f"Modifica non riuscita: {e}")
+
+    if not has_real_trade and str(row.get("status") or "") == "PUBBLICATO":
+        st.divider()
+        st.caption("Se la dinamica non offre un ingresso valido puoi chiudere il setup senza conteggiarlo come perdita.")
+        c1, c2 = st.columns(2)
+        if c1.button("⚪ NESSUN TRADE", key=f"{key_prefix}_no_trade_{sid}", use_container_width=True):
+            update_signal(sid, status="NESSUN TRADE", outcome="NESSUN TRADE", result_note="Segnale non eseguito")
+            st.rerun()
+        if c2.button("⛔ SETUP ANNULLATO", key=f"{key_prefix}_cancel_{sid}", use_container_width=True):
+            update_signal(sid, status="ANNULLATO", outcome="ANNULLATO", result_note="Setup annullato")
+            st.rerun()
+
+
+def edit_signal_panel(row: Dict[str, Any], key_prefix: str) -> None:
+    """Versione espandibile usata nell'Archivio."""
+    if not can_write():
+        return
+    with st.expander("✏️ Modifica dati segnale", expanded=False):
+        _edit_signal_body(row, key_prefix)
+
+
+@st.dialog("Modifica segnale", width="large")
+def edit_signal_dialog(signal_id: int) -> None:
+    row = load_signal(int(signal_id))
+    if not row:
+        st.warning("Segnale non trovato.")
+        return
+    st.markdown(f"### #{int(signal_id)} · {row.get('instrument','')} · {row.get('direction','')}")
+    _edit_signal_body(row, key_prefix=f"dash_dialog_{int(signal_id)}")
 
 
 # -----------------------------------------------------------------------------
@@ -808,7 +841,7 @@ def format_target_distance(row: Dict[str, Any], current_price: Optional[float]) 
 
 def open_trade_status_label(row: Dict[str, Any]) -> str:
     if str(row.get("status") or "") == "T1 RAGGIUNTO" or (row.get("t1_hit_time") and not row.get("t2_hit_time")):
-        return "T1 RAGGIUNTO — T2 IN ATTESA"
+        return "T1 OK - T2 IN ATTESA"
     return str(row.get("status") or "—")
 
 
@@ -981,7 +1014,7 @@ def styled_signals_dataframe(df: pd.DataFrame, quotes: Optional[Dict[str, float]
             continue
         status = str(raw.get("status") or "")
         if status == "T1 RAGGIUNTO":
-            display.at[idx, "Stato"] = "T1 RAGGIUNTO — T2 IN ATTESA"
+            display.at[idx, "Stato"] = "T1 OK - T2 IN ATTESA"
             display.at[idx, "Esito"] = "—"
         elif str(raw.get("outcome") or "") == "T1 APERTO":
             # Compatibilità con record salvati dalle versioni precedenti.
@@ -1234,124 +1267,6 @@ def page_new_signal() -> None:
             st.code((ocr.get("top_text", "") + "\n---\n" + ocr.get("full_text", "")).strip())
 
 
-def page_manage() -> None:
-    if not can_write():
-        st.error("Il tuo profilo è in sola lettura.")
-        return
-    st.subheader("Gestione trade reale")
-    df = load_signals()
-    if df.empty:
-        st.info("Non ci sono segnali aperti da gestire.")
-        return
-    df = df[~df["status"].isin(["CHIUSO", "NESSUN TRADE", "ANNULLATO"])]
-    if df.empty:
-        st.info("Non ci sono segnali aperti da gestire.")
-        return
-
-    labels = {
-        int(r["id"]): f"#{int(r['id'])} · {r['valid_date']} · {r['instrument']} · {r['direction']} · {open_trade_status_label(r.to_dict())}"
-        for _, r in df.iterrows()
-    }
-    selected_id = st.selectbox("Seleziona segnale", list(labels.keys()), format_func=lambda x: labels[x])
-    row = load_signal(int(selected_id))
-    if row is None:
-        return
-
-    st.markdown(f"### {row['instrument']} — {row['direction']}")
-    st.write(f"**Data:** {row['valid_date']}  |  **Stato:** {open_trade_status_label(row)}")
-    st.write(
-        f"**E1:** {fmt_num(row.get('e1')) or '—'} · **S1:** {fmt_num(row.get('s1')) or '—'} · "
-        f"**E2:** {fmt_num(row.get('e2')) or '—'} · **S2:** {fmt_num(row.get('s2')) or '—'}"
-    )
-    st.write(f"**T1:** {fmt_num(row.get('t1')) or '—'} · **T2:** {fmt_num(row.get('t2')) or '—'}")
-    conf = confirmations_list(row.get("confirmations"))
-    st.write(
-        f"**Origine:** {row.get('setup_origin') or '—'} · **Riferimento:** {row.get('reference_area') or '—'} · "
-        f"**TF:** {row.get('setup_timeframe') or '—'}"
-    )
-    st.write(f"**Conferme:** {', '.join(conf) if conf else '—'}")
-    if row.get("notes"):
-        st.info(row["notes"])
-    image_open_button(
-        row.get("screenshot_path") or "",
-        f"Segnale #{selected_id} · {row['instrument']} · {row['direction']} · {row['valid_date']}",
-        key=f"open_img_manage_{selected_id}",
-        use_container_width=False,
-    )
-
-    edit_signal_panel(row, key_prefix="manage")
-
-    # Prezzo automatico: nessun pulsante separato. Il dato già letto dal monitoraggio viene riutilizzato.
-    live_price, live_source, live_time = get_market_quote(str(row.get("ticker") or ""), allow_fetch=True)
-    if live_price is not None:
-        st.session_state[f"live_{selected_id}"] = live_price
-
-    if row["status"] == "PUBBLICATO":
-        if live_price is not None:
-            st.caption(f"Prezzo attuale indicativo: {fmt_num(live_price)} · {live_source} · può essere ritardato")
-        st.markdown("#### Registra ingresso effettivo")
-        suggested = live_price if live_price is not None else st.session_state.get(f"live_{selected_id}")
-        with st.form(f"entry_form_{selected_id}"):
-            c1, c2 = st.columns(2)
-            entry_raw = c1.text_input(
-                "Entry effettiva", value=fmt_num(suggested),
-                help="Il prezzo corrente viene proposto automaticamente; puoi sostituirlo con il prezzo reale di esecuzione.",
-            )
-            stop_raw = c2.text_input("Stop effettivo", value="")
-            dtc1, dtc2 = st.columns(2)
-            now = local_now()
-            entry_date = dtc1.date_input("Data ingresso", value=now.date())
-            entry_time_value = dtc2.time_input("Ora ingresso", value=now.time().replace(microsecond=0))
-            register = st.form_submit_button("🟢 REGISTRA INGRESSO", type="primary", use_container_width=True)
-        if register:
-            entry = normalize_number(entry_raw)
-            stop = normalize_number(stop_raw)
-            entry_dt = datetime.combine(entry_date, entry_time_value, tzinfo=LOCAL_TZ)
-            if entry is None or stop is None:
-                st.error("Inserisci Entry effettiva e Stop effettivo validi.")
-            else:
-                update_signal(
-                    int(selected_id), actual_entry=entry, actual_stop=stop,
-                    entry_time=entry_dt.isoformat(timespec="seconds"), status="IN TRADE",
-                    outcome=None, result_note="Ingresso reale registrato",
-                )
-                st.success("Ingresso reale registrato. Da ora il trade può essere monitorato automaticamente.")
-                st.rerun()
-
-        c1, c2 = st.columns(2)
-        if c1.button("⚪ NESSUN TRADE", use_container_width=True):
-            update_signal(int(selected_id), status="NESSUN TRADE", outcome="NESSUN TRADE", result_note="Segnale non eseguito")
-            st.rerun()
-        if c2.button("⛔ SETUP ANNULLATO", use_container_width=True):
-            update_signal(int(selected_id), status="ANNULLATO", outcome="ANNULLATO", result_note="Setup annullato")
-            st.rerun()
-    else:
-        st.markdown("#### Trade in monitoraggio")
-        status_label = open_trade_status_label(row)
-        distance = format_target_distance(row, live_price)
-        price_label = fmt_num(live_price) if live_price is not None else "—"
-        icon = "🟢" if row.get("t1_hit_time") else "🔵"
-        st.info(f"{icon} {status_label} · Prezzo attuale: {price_label} · Dist. target: {distance}")
-        st.write(f"**Entry reale:** {fmt_num(row.get('actual_entry'))} · **Stop reale:** {fmt_num(row.get('actual_stop'))} · **Ora ingresso:** {row.get('entry_time') or '—'}")
-        if live_price is not None:
-            st.caption(f"Prezzo: {live_source} · dato indicativo, può essere ritardato")
-        if row.get("t1_hit_time"):
-            st.success(f"T1 raggiunto: {row['t1_hit_time']}")
-        if st.button("🔄 Aggiorna questo trade", type="primary"):
-            with st.spinner("Controllo sequenza prezzi..."):
-                try:
-                    res = evaluate_trade(row)
-                    update_signal(
-                        int(selected_id), status=res.get("status") or row["status"], outcome=res.get("outcome"),
-                        t1_hit_time=res.get("t1_hit_time"), t2_hit_time=res.get("t2_hit_time"),
-                        stop_hit_time=res.get("stop_hit_time"), result_note=res.get("note", ""), last_check=now_iso(),
-                    )
-                    st.success(res.get("note", "Aggiornato"))
-                    st.rerun()
-                except Exception as e:
-                    st.error(str(e))
-
-
 @st.fragment(run_every="60s")
 def dashboard_live_panel(auto_monitor: bool) -> None:
     # Il frammento si aggiorna ogni 60 secondi solo mentre la Dashboard è aperta.
@@ -1398,11 +1313,61 @@ def dashboard_live_panel(auto_monitor: bool) -> None:
         st.warning("\n".join(notes))
 
     quotes = dashboard_quotes(df, allow_fetch=not (auto_monitor and can_write()))
-    st.dataframe(styled_signals_dataframe(df, quotes), use_container_width=True, hide_index=True)
+    table_event = st.dataframe(
+        styled_signals_dataframe(df, quotes),
+        use_container_width=True,
+        hide_index=True,
+        key="dashboard_signals_table",
+        on_select="rerun",
+        selection_mode="single-row",
+    )
     st.caption(
         "Per i trade aperti: prima di T1 viene mostrata la distanza da T1; dopo T1 la distanza da T2. "
-        "T1/T2 diventano verdi quando raggiunti; lo Stop reale diventa rosso se colpito."
+        "T1/T2 diventano verdi quando raggiunti; lo Stop reale diventa rosso se colpito. Seleziona una riga per modificarla o aprire il grafico allegato."
     )
+
+    selected_rows = []
+    try:
+        selected_rows = list(table_event.selection.rows)
+    except Exception:
+        try:
+            selected_rows = list(table_event.get("selection", {}).get("rows", []))
+        except Exception:
+            selected_rows = []
+
+    if selected_rows:
+        pos = int(selected_rows[0])
+        if 0 <= pos < len(df):
+            selected_raw = df.iloc[pos].to_dict()
+            sid = int(selected_raw["id"])
+            st.caption(
+                f"Segnale selezionato: #{sid} · {selected_raw.get('instrument','')} · "
+                f"{selected_raw.get('direction','')} · {selected_raw.get('valid_date','')}"
+            )
+            if can_write():
+                a1, a2 = st.columns(2)
+                if a1.button("✏️ Modifica", key=f"dashboard_edit_{sid}", use_container_width=True):
+                    edit_signal_dialog(sid)
+                if a2.button(
+                    "🖼️ Apri grafico allegato", key=f"dashboard_image_{sid}",
+                    use_container_width=True, disabled=not bool(selected_raw.get("screenshot_path")),
+                ):
+                    open_signal_image_dialog(
+                        selected_raw.get("screenshot_path") or "",
+                        f"Segnale #{sid} · {selected_raw.get('instrument','')} · {selected_raw.get('direction','')} · {selected_raw.get('valid_date','')}",
+                    )
+            else:
+                if st.button(
+                    "🖼️ Apri grafico allegato", key=f"dashboard_image_view_{sid}",
+                    use_container_width=True, disabled=not bool(selected_raw.get("screenshot_path")),
+                ):
+                    open_signal_image_dialog(
+                        selected_raw.get("screenshot_path") or "",
+                        f"Segnale #{sid} · {selected_raw.get('instrument','')} · {selected_raw.get('direction','')} · {selected_raw.get('valid_date','')}",
+                    )
+    else:
+        st.caption("⬆️ Seleziona una riga della tabella per mostrare i comandi Modifica e Apri grafico allegato.")
+
     st.download_button(
         "⬇️ Esporta storico Excel", data=excel_bytes(df),
         file_name=f"signal_tracker_{local_now().date().isoformat()}.xlsx",
@@ -1618,10 +1583,10 @@ def page_info() -> None:
         Dalla V1.3 segnali e screenshot vengono conservati in **Supabase**. Un reboot o un nuovo deploy di Streamlit
         non cancella più l'archivio. Gli utenti hanno ruoli separati: Amministratore, Collaboratore e Solo lettura.
 
-        **Monitoraggio V1.4**
+        **Dashboard operativa V1.9**
 
-        In Dashboard è disponibile un controllo automatico ogni 60 secondi dei trade aperti. Prezzo attuale e distanza dal target attivo sono mostrati sulla stessa riga. T1, T2 e Stop vengono
-        evidenziati visivamente quando risultano raggiunti. Il controllo usa dati Yahoo Finance e può quindi essere
+        In Dashboard è disponibile il controllo automatico ogni 60 secondi dei trade aperti. Prezzo attuale e distanza dal target attivo sono mostrati sulla stessa riga. T1, T2 e Stop vengono
+        evidenziati visivamente quando risultano raggiunti. Selezionando una riga puoi modificare il segnale o aprire il grafico allegato senza una sezione separata di gestione trade. Il controllo usa dati Yahoo Finance e può quindi essere
         ritardato: non è un feed tick-by-tick professionale.
         """
     )
@@ -1658,7 +1623,7 @@ with st.sidebar:
 
     pages = ["Dashboard"]
     if can_write():
-        pages += ["Carica nuovo segnale", "Gestione trade"]
+        pages += ["Carica nuovo segnale"]
     pages += ["Statistiche", "Archivio"]
     if is_admin():
         pages += ["Utenti"]
@@ -1681,8 +1646,6 @@ try:
         page_dashboard()
     elif page == "Carica nuovo segnale":
         page_new_signal()
-    elif page == "Gestione trade":
-        page_manage()
     elif page == "Statistiche":
         page_stats()
     elif page == "Archivio":
