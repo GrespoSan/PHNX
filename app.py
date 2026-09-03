@@ -18,7 +18,7 @@ import yfinance as yf
 from supabase import create_client, Client
 
 APP_NAME = "G. Signal Tracker"
-APP_VERSION = "V2.8"
+APP_VERSION = "V3.0"
 BUCKET_NAME = "signal-screenshots"
 LOCAL_TZ = ZoneInfo("Europe/Rome")
 
@@ -33,11 +33,11 @@ CONFIRMATIONS = [
     "Revolving Door",
     "Medie mobili",
     "M4",
+    "Divergenze",
     "Stocastico/TDI",
     "Bollinger",
     "Supertrend",
     "Price Action",
-    "Divergenze",
     "News",
     "Altro",
 ]
@@ -1178,6 +1178,82 @@ def image_open_button(storage_path: str, signal_label: str, key: str, use_contai
         st.caption("🖼️ Screenshot originale non disponibile.")
 
 
+def trade_is_concluded(row: Dict[str, Any]) -> bool:
+    """True solo per trade realmente entrati e ormai risolti/da verificare."""
+    return row.get("actual_entry") is not None and str(row.get("status") or "") in {"CHIUSO", "AMBIGUO"}
+
+
+@st.dialog("Screenshot finale", width="large")
+def final_screenshot_dialog(signal_id: int) -> None:
+    row = load_signal(int(signal_id))
+    if not row:
+        st.warning("Segnale non trovato.")
+        return
+    if not trade_is_concluded(row):
+        st.info("Lo screenshot finale diventa disponibile quando il trade è concluso.")
+        return
+
+    sid = int(row["id"])
+    label = f"Segnale #{sid} · {row.get('instrument','')} · {row.get('direction','')} · {row.get('valid_date','')}"
+    existing_path = str(row.get("final_screenshot_path") or "")
+
+    if existing_path:
+        raw = download_screenshot(existing_path)
+        if raw:
+            st.image(raw, caption=f"Screenshot finale · {label}", use_container_width=True)
+        else:
+            st.warning("Il percorso dello screenshot finale è salvato, ma il file non è disponibile nello Storage.")
+    else:
+        st.caption("Nessuno screenshot finale caricato. Campo facoltativo.")
+
+    if not can_write():
+        return
+
+    uploaded = st.file_uploader(
+        "📸 Carica screenshot finale — facoltativo",
+        type=["png", "jpg", "jpeg", "webp"],
+        key=f"final_shot_upload_{sid}",
+    )
+    if uploaded is not None:
+        action_label = "💾 Salva screenshot finale" if not existing_path else "🔁 Sostituisci screenshot finale"
+        if st.button(action_label, key=f"save_final_shot_{sid}", type="primary", use_container_width=True):
+            new_path = ""
+            try:
+                new_path = upload_screenshot(uploaded)
+                update_signal(sid, final_screenshot_path=new_path)
+                if existing_path and existing_path != new_path:
+                    remove_screenshot(existing_path)
+                st.success("Screenshot finale salvato.")
+                st.rerun()
+            except Exception as e:
+                if new_path:
+                    remove_screenshot(new_path)
+                st.error(
+                    "Salvataggio screenshot finale non riuscito. "
+                    "Verifica di aver eseguito la migration Supabase V3.0. "
+                    f"Dettaglio: {e}"
+                )
+
+    if existing_path:
+        if st.button("🗑️ Rimuovi screenshot finale", key=f"remove_final_shot_{sid}", use_container_width=True):
+            try:
+                update_signal(sid, final_screenshot_path=None)
+                remove_screenshot(existing_path)
+                st.success("Screenshot finale rimosso.")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Rimozione non riuscita: {e}")
+
+
+def final_screenshot_button(row: Dict[str, Any], key: str, use_container_width: bool = True) -> None:
+    if not trade_is_concluded(row):
+        return
+    has_final = bool(row.get("final_screenshot_path"))
+    label = "📸 Apri screenshot finale" if has_final else "📸 Carica screenshot finale"
+    if st.button(label, key=key, use_container_width=use_container_width, disabled=(not has_final and not can_write())):
+        final_screenshot_dialog(int(row["id"]))
+
+
 # -----------------------------------------------------------------------------
 # Pagine
 # -----------------------------------------------------------------------------
@@ -1407,11 +1483,12 @@ def dashboard_live_panel(auto_monitor: bool) -> None:
                 f"Segnale selezionato: #{sid} · {selected_raw.get('instrument','')} · "
                 f"{selected_raw.get('direction','')} · {selected_raw.get('valid_date','')}"
             )
+            concluded = trade_is_concluded(selected_raw)
             if can_write():
-                a1, a2 = st.columns(2)
-                if a1.button("✏️ Modifica", key=f"dashboard_edit_{sid}", use_container_width=True):
+                cols = st.columns(3 if concluded else 2)
+                if cols[0].button("✏️ Modifica", key=f"dashboard_edit_{sid}", use_container_width=True):
                     edit_signal_dialog(sid)
-                if a2.button(
+                if cols[1].button(
                     "🖼️ Apri grafico allegato", key=f"dashboard_image_{sid}",
                     use_container_width=True, disabled=not bool(selected_raw.get("screenshot_path")),
                 ):
@@ -1419,8 +1496,14 @@ def dashboard_live_panel(auto_monitor: bool) -> None:
                         selected_raw.get("screenshot_path") or "",
                         f"Segnale #{sid} · {selected_raw.get('instrument','')} · {selected_raw.get('direction','')} · {selected_raw.get('valid_date','')}",
                     )
+                if concluded:
+                    has_final = bool(selected_raw.get("final_screenshot_path"))
+                    final_label = "📸 Apri screenshot finale" if has_final else "📸 Carica screenshot finale"
+                    if cols[2].button(final_label, key=f"dashboard_final_{sid}", use_container_width=True):
+                        final_screenshot_dialog(sid)
             else:
-                if st.button(
+                cols = st.columns(2 if concluded and selected_raw.get("final_screenshot_path") else 1)
+                if cols[0].button(
                     "🖼️ Apri grafico allegato", key=f"dashboard_image_view_{sid}",
                     use_container_width=True, disabled=not bool(selected_raw.get("screenshot_path")),
                 ):
@@ -1428,6 +1511,9 @@ def dashboard_live_panel(auto_monitor: bool) -> None:
                         selected_raw.get("screenshot_path") or "",
                         f"Segnale #{sid} · {selected_raw.get('instrument','')} · {selected_raw.get('direction','')} · {selected_raw.get('valid_date','')}",
                     )
+                if concluded and selected_raw.get("final_screenshot_path"):
+                    if cols[1].button("📸 Apri screenshot finale", key=f"dashboard_final_view_{sid}", use_container_width=True):
+                        final_screenshot_dialog(sid)
     st.download_button(
         "⬇️ Esporta storico Excel", data=excel_bytes(df),
         file_name=f"signal_tracker_{local_now().date().isoformat()}.xlsx",
@@ -1543,17 +1629,24 @@ def page_archive() -> None:
         sid = st.selectbox("Apri dettaglio segnale", ids, format_func=lambda x: f"Segnale #{x}")
         row = load_signal(int(sid))
         if row:
-            image_open_button(
-                row.get("screenshot_path") or "",
-                f"Segnale #{sid} · {row['instrument']} · {row['direction']} · {row['valid_date']}",
-                key=f"open_img_archive_{sid}",
-            )
+            concluded = trade_is_concluded(row)
+            if concluded:
+                a1, a2 = st.columns(2)
+                with a1:
+                    image_open_button(
+                        row.get("screenshot_path") or "",
+                        f"Segnale #{sid} · {row['instrument']} · {row['direction']} · {row['valid_date']}",
+                        key=f"open_img_archive_{sid}",
+                    )
+                with a2:
+                    final_screenshot_button(row, key=f"final_img_archive_{sid}")
+            else:
+                image_open_button(
+                    row.get("screenshot_path") or "",
+                    f"Segnale #{sid} · {row['instrument']} · {row['direction']} · {row['valid_date']}",
+                    key=f"open_img_archive_{sid}",
+                )
             edit_signal_panel(row, key_prefix="archive")
-            with st.expander("Dettaglio completo", expanded=False):
-                clean = {k: v for k, v in row.items() if k not in {"ocr_text", "created_by", "updated_by"}}
-                st.json(clean, expanded=False)
-                if row.get("ocr_text"):
-                    st.code(row["ocr_text"])
 
 
 def page_users() -> None:
@@ -1632,22 +1725,11 @@ def page_info() -> None:
         """
         **Principio operativo**
 
-        - **Contesto**: Balance / Punto di svolta / entrambi, con eventuali conferme facoltative.
+        - **Contesto**: Balance / Punto di svolta / Revolving Door, con eventuali conferme facoltative.
         - **Segnale originale**: E1/E2 e S1/S2 sono riferimenti indicativi definiti prima della giornata operativa.
         - **Trade reale**: Entry effettiva e Stop effettivo vengono registrati quando la dinamica del mercato dà l'ingresso.
         - **Nessun trade**: se non compare un ingresso valido, il segnale non viene classificato come perdita.
         - **Statistiche**: vengono separate la qualità dell'idea iniziale e l'efficacia dei trade realmente eseguiti.
-
-        **Persistenza e collaborazione**
-
-        Dalla V1.3 segnali e screenshot vengono conservati in **Supabase**. Un reboot o un nuovo deploy di Streamlit
-        non cancella più l'archivio. Gli utenti hanno ruoli separati: Amministratore, Collaboratore e Solo lettura.
-
-        **Dashboard operativa V1.9**
-
-        In Dashboard è disponibile il controllo automatico ogni 60 secondi dei trade aperti. Prezzo attuale e distanza dal target attivo sono mostrati sulla stessa riga. T1, T2 e Stop vengono
-        evidenziati visivamente quando risultano raggiunti. Selezionando una riga puoi modificare il segnale o aprire il grafico allegato senza una sezione separata di gestione trade. Il controllo usa dati Yahoo Finance e può quindi essere
-        ritardato: non è un feed tick-by-tick professionale.
         """
     )
 
