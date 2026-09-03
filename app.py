@@ -4,7 +4,7 @@ import io
 import hashlib
 import re
 import shutil
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple
 from zoneinfo import ZoneInfo
@@ -18,7 +18,7 @@ import yfinance as yf
 from supabase import create_client, Client
 
 APP_NAME = "G. Signal Tracker"
-APP_VERSION = "V1.7"
+APP_VERSION = "V1.8"
 BUCKET_NAME = "signal-screenshots"
 LOCAL_TZ = ZoneInfo("Europe/Rome")
 
@@ -653,6 +653,7 @@ def edit_signal_panel(row: Dict[str, Any], key_prefix: str) -> None:
 # Dati mercato / monitoraggio trade
 # -----------------------------------------------------------------------------
 
+@st.cache_data(ttl=55, show_spinner=False)
 def get_current_price(ticker: str) -> Tuple[Optional[float], str]:
     if not ticker:
         return None, "Ticker Yahoo Finance mancante"
@@ -675,6 +676,7 @@ def get_current_price(ticker: str) -> Tuple[Optional[float], str]:
         return None, f"Errore Yahoo Finance: {e}"
 
 
+@st.cache_data(ttl=50, show_spinner=False)
 def fetch_intraday(ticker: str, start_dt: datetime) -> Tuple[pd.DataFrame, str]:
     now = datetime.now(start_dt.tzinfo) if start_dt.tzinfo else datetime.now()
     age_days = max(0, (now - start_dt).days)
@@ -703,6 +705,113 @@ def fetch_intraday(ticker: str, start_dt: datetime) -> Tuple[pd.DataFrame, str]:
     return df, interval
 
 
+def _store_market_quote(ticker: str, price: Optional[float], quote_time: Any = None, source: str = "Yahoo Finance") -> None:
+    """Conserva in sessione l'ultimo prezzo già letto, evitando richieste duplicate a Yahoo."""
+    if not ticker or price is None:
+        return
+    try:
+        value = float(price)
+        if not np.isfinite(value):
+            return
+    except Exception:
+        return
+
+    if quote_time is None:
+        ts = local_now().isoformat(timespec="seconds")
+    else:
+        try:
+            if hasattr(quote_time, "isoformat"):
+                ts = quote_time.isoformat()
+            else:
+                ts = str(quote_time)
+        except Exception:
+            ts = local_now().isoformat(timespec="seconds")
+
+    quotes = st.session_state.setdefault("market_quotes", {})
+    quotes[str(ticker)] = {"price": value, "time": ts, "source": source}
+
+
+def _recent_market_quote(ticker: str, max_age_seconds: int = 120) -> Optional[Dict[str, Any]]:
+    if not ticker:
+        return None
+    item = (st.session_state.get("market_quotes") or {}).get(str(ticker))
+    if not item or item.get("price") is None:
+        return None
+    try:
+        ts = datetime.fromisoformat(str(item.get("time", "")).replace("Z", "+00:00"))
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=LOCAL_TZ)
+        else:
+            ts = ts.astimezone(LOCAL_TZ)
+        if local_now() - ts > timedelta(seconds=max_age_seconds):
+            return None
+    except Exception:
+        return None
+    return item
+
+
+def get_market_quote(ticker: str, allow_fetch: bool = True) -> Tuple[Optional[float], str, Optional[str]]:
+    """Prezzo corrente con riuso del dato già acquisito dal monitoraggio."""
+    recent = _recent_market_quote(ticker)
+    if recent:
+        return float(recent["price"]), str(recent.get("source") or "Yahoo Finance"), str(recent.get("time") or "")
+    if not allow_fetch:
+        return None, "", None
+    price, source = get_current_price(ticker)
+    if price is not None:
+        _store_market_quote(ticker, price, local_now(), source)
+        recent = _recent_market_quote(ticker)
+        return price, source, str(recent.get("time")) if recent else now_iso()
+    return None, source, None
+
+
+def active_target_distance(row: Dict[str, Any], current_price: Optional[float]) -> Tuple[Optional[str], Optional[float], Optional[float]]:
+    """Restituisce target attivo (T1/T2), distanza in punti e percentuale dal prezzo corrente."""
+    if current_price is None:
+        return None, None, None
+    status = str(row.get("status") or "")
+    if status not in {"IN TRADE", "T1 RAGGIUNTO"}:
+        return None, None, None
+
+    if row.get("t1_hit_time"):
+        label = "T2"
+        target = row.get("t2")
+        if row.get("t2_hit_time"):
+            return None, None, None
+    else:
+        label = "T1"
+        target = row.get("t1")
+
+    if target is None:
+        return None, None, None
+    try:
+        price = float(current_price)
+        target_value = float(target)
+    except Exception:
+        return None, None, None
+    if price == 0:
+        return label, None, None
+
+    direction = str(row.get("direction") or "").upper()
+    remaining = target_value - price if direction == "LONG" else price - target_value
+    remaining = max(0.0, remaining)
+    pct = (remaining / abs(price)) * 100.0
+    return label, remaining, pct
+
+
+def format_target_distance(row: Dict[str, Any], current_price: Optional[float]) -> str:
+    label, points, pct = active_target_distance(row, current_price)
+    if not label or points is None or pct is None:
+        return "—"
+    return f"{label}: {fmt_num(points)} pt · {pct:.2f}%"
+
+
+def open_trade_status_label(row: Dict[str, Any]) -> str:
+    if str(row.get("status") or "") == "T1 RAGGIUNTO" or (row.get("t1_hit_time") and not row.get("t2_hit_time")):
+        return "T1 RAGGIUNTO — T2 IN ATTESA"
+    return str(row.get("status") or "—")
+
+
 def evaluate_trade(row: Dict[str, Any]) -> Dict[str, Optional[str]]:
     if not row.get("ticker") or not row.get("entry_time") or row.get("actual_entry") is None or row.get("actual_stop") is None:
         return {"status": row.get("status"), "outcome": row.get("outcome"), "note": "Dati trade incompleti"}
@@ -714,6 +823,15 @@ def evaluate_trade(row: Dict[str, Any]) -> Dict[str, Optional[str]]:
     df, interval = fetch_intraday(str(row["ticker"]), start_dt)
     if df.empty:
         return {"status": row.get("status"), "outcome": row.get("outcome"), "note": "Dati prezzo non disponibili"}
+
+    # L'ultima chiusura della serie intraday è riutilizzata anche come prezzo corrente in UI.
+    try:
+        closes = df["Close"].dropna()
+        if not closes.empty:
+            quote_ts = closes.index[-1]
+            _store_market_quote(str(row["ticker"]), float(closes.iloc[-1]), quote_ts, "Yahoo Finance")
+    except Exception:
+        pass
 
     direction = str(row["direction"]).upper()
     stop = float(row["actual_stop"])
@@ -766,14 +884,14 @@ def evaluate_trade(row: Dict[str, Any]) -> Dict[str, Optional[str]]:
 
     if t1_done:
         return {
-            "status": "T1 RAGGIUNTO", "outcome": "T1 APERTO", "t1_hit_time": t1_time,
+            "status": "T1 RAGGIUNTO", "outcome": None, "t1_hit_time": t1_time,
             "t2_hit_time": t2_time, "stop_hit_time": stop_time,
-            "note": f"T1 raggiunto, trade ancora da monitorare; barre {interval}.",
+            "note": f"T1 raggiunto; T2 ancora in attesa. Controllo con barre {interval}.",
         }
     return {
         "status": "IN TRADE", "outcome": None, "t1_hit_time": t1_time,
         "t2_hit_time": t2_time, "stop_hit_time": stop_time,
-        "note": f"Nessun livello finale raggiunto; barre {interval}.",
+        "note": f"T1 non ancora raggiunto; controllo con barre {interval}.",
     }
 
 
@@ -820,7 +938,9 @@ def dataframe_for_display(df: pd.DataFrame) -> pd.DataFrame:
     if "confirmations" in out.columns:
         out["confirmations"] = out["confirmations"].map(lambda x: ", ".join(confirmations_list(x)))
     if "outcome" in out.columns:
-        out["outcome"] = out["outcome"].map(lambda x: "—" if x is None or pd.isna(x) or str(x) == "None" else str(x))
+        out["outcome"] = out["outcome"].map(
+            lambda x: "—" if x is None or pd.isna(x) or str(x) in {"None", "T1 APERTO"} else str(x)
+        )
     cols = [
         "id", "valid_date", "instrument", "direction", "e1", "e2", "t1", "t2",
         "setup_origin", "confirmations", "actual_entry", "actual_stop", "status", "outcome",
@@ -833,18 +953,54 @@ def dataframe_for_display(df: pd.DataFrame) -> pd.DataFrame:
     })
 
 
-def styled_signals_dataframe(df: pd.DataFrame):
-    """Evidenzia visivamente target/stop raggiunti senza alterare i dati salvati."""
+def styled_signals_dataframe(df: pd.DataFrame, quotes: Optional[Dict[str, float]] = None):
+    """Evidenzia livelli raggiunti e aggiunge prezzo/distanza del target attivo sulla stessa riga."""
     display = dataframe_for_display(df)
     if display.empty:
         return display
 
-    raw_by_id = {}
+    quotes = quotes or {}
+    display["Prezzo attuale"] = "—"
+    display["Dist. target"] = "—"
+
+    raw_by_id: Dict[int, Dict[str, Any]] = {}
     for _, r in df.iterrows():
         try:
-            raw_by_id[int(r["id"])] = r
+            raw_by_id[int(r["id"])] = r.to_dict() if hasattr(r, "to_dict") else dict(r)
         except Exception:
             pass
+
+    # Compila i dati dinamici prima dello styling.
+    for idx, drow in display.iterrows():
+        try:
+            sid = int(drow.get("ID"))
+        except Exception:
+            continue
+        raw = raw_by_id.get(sid)
+        if not raw:
+            continue
+        status = str(raw.get("status") or "")
+        if status == "T1 RAGGIUNTO":
+            display.at[idx, "Stato"] = "T1 RAGGIUNTO — T2 IN ATTESA"
+            display.at[idx, "Esito"] = "—"
+        elif str(raw.get("outcome") or "") == "T1 APERTO":
+            # Compatibilità con record salvati dalle versioni precedenti.
+            display.at[idx, "Esito"] = "—"
+
+        if status in {"IN TRADE", "T1 RAGGIUNTO"}:
+            ticker = str(raw.get("ticker") or "")
+            price = quotes.get(ticker)
+            if price is not None:
+                display.at[idx, "Prezzo attuale"] = fmt_num(price)
+                display.at[idx, "Dist. target"] = format_target_distance(raw, price)
+
+    # Sposta prezzo e distanza immediatamente prima dello Stato.
+    ordered = list(display.columns)
+    for col in ["Prezzo attuale", "Dist. target"]:
+        ordered.remove(col)
+    insert_at = ordered.index("Stato") if "Stato" in ordered else len(ordered)
+    ordered[insert_at:insert_at] = ["Prezzo attuale", "Dist. target"]
+    display = display[ordered]
 
     def style_row(row: pd.Series) -> List[str]:
         styles = [""] * len(row.index)
@@ -860,7 +1016,6 @@ def styled_signals_dataframe(df: pd.DataFrame):
             if col in row.index:
                 styles[row.index.get_loc(col)] = css
 
-        # Celle livello: verde quando target raggiunto, rosso quando stop raggiunto.
         if raw.get("t1_hit_time"):
             set_style("T1", "background-color: #1f6f3d; color: white; font-weight: 700;")
         if raw.get("t2_hit_time"):
@@ -884,10 +1039,27 @@ def styled_signals_dataframe(df: pd.DataFrame):
             css = ""
         if css:
             set_style("Stato", css)
-            set_style("Esito", css)
+            if row.get("Esito") != "—":
+                set_style("Esito", css)
         return styles
 
     return display.style.apply(style_row, axis=1)
+
+
+def dashboard_quotes(df: pd.DataFrame, allow_fetch: bool) -> Dict[str, float]:
+    quotes: Dict[str, float] = {}
+    if df.empty:
+        return quotes
+    open_df = df[df["status"].isin(["IN TRADE", "T1 RAGGIUNTO"])] if "status" in df else pd.DataFrame()
+    if open_df.empty:
+        return quotes
+    for ticker in open_df.get("ticker", pd.Series(dtype=str)).dropna().astype(str).unique().tolist():
+        if not ticker:
+            continue
+        price, _, _ = get_market_quote(ticker, allow_fetch=allow_fetch)
+        if price is not None:
+            quotes[ticker] = float(price)
+    return quotes
 
 
 def last_market_check_label(df: pd.DataFrame) -> str:
@@ -1077,7 +1249,7 @@ def page_manage() -> None:
         return
 
     labels = {
-        int(r["id"]): f"#{int(r['id'])} · {r['valid_date']} · {r['instrument']} · {r['direction']} · {r['status']}"
+        int(r["id"]): f"#{int(r['id'])} · {r['valid_date']} · {r['instrument']} · {r['direction']} · {open_trade_status_label(r.to_dict())}"
         for _, r in df.iterrows()
     }
     selected_id = st.selectbox("Seleziona segnale", list(labels.keys()), format_func=lambda x: labels[x])
@@ -1085,55 +1257,45 @@ def page_manage() -> None:
     if row is None:
         return
 
-    col_a, col_b = st.columns([2, 1])
-    with col_a:
-        st.markdown(f"### {row['instrument']} — {row['direction']}")
-        st.write(f"**Data:** {row['valid_date']}  |  **Stato:** {row['status']}")
-        st.write(
-            f"**E1:** {fmt_num(row.get('e1')) or '—'} · **S1:** {fmt_num(row.get('s1')) or '—'} · "
-            f"**E2:** {fmt_num(row.get('e2')) or '—'} · **S2:** {fmt_num(row.get('s2')) or '—'}"
-        )
-        st.write(f"**T1:** {fmt_num(row.get('t1')) or '—'} · **T2:** {fmt_num(row.get('t2')) or '—'}")
-        conf = confirmations_list(row.get("confirmations"))
-        st.write(
-            f"**Origine:** {row.get('setup_origin') or '—'} · **Riferimento:** {row.get('reference_area') or '—'} · "
-            f"**TF:** {row.get('setup_timeframe') or '—'}"
-        )
-        st.write(f"**Conferme:** {', '.join(conf) if conf else '—'}")
-        if row.get("notes"):
-            st.info(row["notes"])
-        image_open_button(
-            row.get("screenshot_path") or "",
-            f"Segnale #{selected_id} · {row['instrument']} · {row['direction']} · {row['valid_date']}",
-            key=f"open_img_manage_{selected_id}",
-            use_container_width=False,
-        )
+    st.markdown(f"### {row['instrument']} — {row['direction']}")
+    st.write(f"**Data:** {row['valid_date']}  |  **Stato:** {open_trade_status_label(row)}")
+    st.write(
+        f"**E1:** {fmt_num(row.get('e1')) or '—'} · **S1:** {fmt_num(row.get('s1')) or '—'} · "
+        f"**E2:** {fmt_num(row.get('e2')) or '—'} · **S2:** {fmt_num(row.get('s2')) or '—'}"
+    )
+    st.write(f"**T1:** {fmt_num(row.get('t1')) or '—'} · **T2:** {fmt_num(row.get('t2')) or '—'}")
+    conf = confirmations_list(row.get("confirmations"))
+    st.write(
+        f"**Origine:** {row.get('setup_origin') or '—'} · **Riferimento:** {row.get('reference_area') or '—'} · "
+        f"**TF:** {row.get('setup_timeframe') or '—'}"
+    )
+    st.write(f"**Conferme:** {', '.join(conf) if conf else '—'}")
+    if row.get("notes"):
+        st.info(row["notes"])
+    image_open_button(
+        row.get("screenshot_path") or "",
+        f"Segnale #{selected_id} · {row['instrument']} · {row['direction']} · {row['valid_date']}",
+        key=f"open_img_manage_{selected_id}",
+        use_container_width=False,
+    )
 
     edit_signal_panel(row, key_prefix="manage")
 
-    live_price = None
-    with col_b:
-        if st.button("💹 Leggi prezzo attuale", use_container_width=True):
-            with st.spinner("Recupero prezzo..."):
-                live_price, src = get_current_price(row.get("ticker") or "")
-            if live_price is not None:
-                st.metric("Prezzo attuale", fmt_num(live_price))
-                st.caption(src + " · dato indicativo, può essere ritardato")
-                st.session_state[f"live_{selected_id}"] = live_price
-            else:
-                st.warning(src)
-        elif f"live_{selected_id}" in st.session_state:
-            live_price = st.session_state[f"live_{selected_id}"]
-            st.metric("Ultimo prezzo letto", fmt_num(live_price))
+    # Prezzo automatico: nessun pulsante separato. Il dato già letto dal monitoraggio viene riutilizzato.
+    live_price, live_source, live_time = get_market_quote(str(row.get("ticker") or ""), allow_fetch=True)
+    if live_price is not None:
+        st.session_state[f"live_{selected_id}"] = live_price
 
     if row["status"] == "PUBBLICATO":
+        if live_price is not None:
+            st.caption(f"Prezzo attuale indicativo: {fmt_num(live_price)} · {live_source} · può essere ritardato")
         st.markdown("#### Registra ingresso effettivo")
-        suggested = st.session_state.get(f"live_{selected_id}")
+        suggested = live_price if live_price is not None else st.session_state.get(f"live_{selected_id}")
         with st.form(f"entry_form_{selected_id}"):
             c1, c2 = st.columns(2)
             entry_raw = c1.text_input(
                 "Entry effettiva", value=fmt_num(suggested),
-                help="Puoi usare il prezzo live come proposta o inserire il prezzo reale.",
+                help="Il prezzo corrente viene proposto automaticamente; puoi sostituirlo con il prezzo reale di esecuzione.",
             )
             stop_raw = c2.text_input("Stop effettivo", value="")
             dtc1, dtc2 = st.columns(2)
@@ -1165,8 +1327,14 @@ def page_manage() -> None:
             st.rerun()
     else:
         st.markdown("#### Trade in monitoraggio")
-        st.write(f"**Entry reale:** {fmt_num(row.get('actual_entry'))} · **Stop reale:** {fmt_num(row.get('actual_stop'))}")
-        st.write(f"**Ora ingresso:** {row.get('entry_time') or '—'}")
+        status_label = open_trade_status_label(row)
+        distance = format_target_distance(row, live_price)
+        price_label = fmt_num(live_price) if live_price is not None else "—"
+        icon = "🟢" if row.get("t1_hit_time") else "🔵"
+        st.info(f"{icon} {status_label} · Prezzo attuale: {price_label} · Dist. target: {distance}")
+        st.write(f"**Entry reale:** {fmt_num(row.get('actual_entry'))} · **Stop reale:** {fmt_num(row.get('actual_stop'))} · **Ora ingresso:** {row.get('entry_time') or '—'}")
+        if live_price is not None:
+            st.caption(f"Prezzo: {live_source} · dato indicativo, può essere ritardato")
         if row.get("t1_hit_time"):
             st.success(f"T1 raggiunto: {row['t1_hit_time']}")
         if st.button("🔄 Aggiorna questo trade", type="primary"):
@@ -1205,7 +1373,7 @@ def dashboard_live_panel(auto_monitor: bool) -> None:
     total = len(df)
     traded = int(df["actual_entry"].notna().sum()) if "actual_entry" in df else 0
     no_trade = int(df["status"].isin(["NESSUN TRADE", "ANNULLATO"]).sum())
-    t1_success = int(df["outcome"].isin(["T2", "T1 + STOP", "T1 APERTO"]).sum())
+    t1_success = int((df["t1_hit_time"].notna() & (df["status"] != "AMBIGUO")).sum())
     stopped_before_t1 = int((df["outcome"] == "STOP").sum())
     resolved_for_wr = t1_success + stopped_before_t1
     wr = (100 * t1_success / resolved_for_wr) if resolved_for_wr else 0.0
@@ -1229,8 +1397,12 @@ def dashboard_live_panel(auto_monitor: bool) -> None:
     if notes:
         st.warning("\n".join(notes))
 
-    st.dataframe(styled_signals_dataframe(df), use_container_width=True, hide_index=True)
-    st.caption("T1/T2 diventano verdi quando risultano raggiunti; lo Stop reale diventa rosso se viene colpito.")
+    quotes = dashboard_quotes(df, allow_fetch=not (auto_monitor and can_write()))
+    st.dataframe(styled_signals_dataframe(df, quotes), use_container_width=True, hide_index=True)
+    st.caption(
+        "Per i trade aperti: prima di T1 viene mostrata la distanza da T1; dopo T1 la distanza da T2. "
+        "T1/T2 diventano verdi quando raggiunti; lo Stop reale diventa rosso se colpito."
+    )
     st.download_button(
         "⬇️ Esporta storico Excel", data=excel_bytes(df),
         file_name=f"signal_tracker_{local_now().date().isoformat()}.xlsx",
@@ -1448,7 +1620,7 @@ def page_info() -> None:
 
         **Monitoraggio V1.4**
 
-        In Dashboard è disponibile un controllo automatico ogni 60 secondi dei trade aperti. T1, T2 e Stop vengono
+        In Dashboard è disponibile un controllo automatico ogni 60 secondi dei trade aperti. Prezzo attuale e distanza dal target attivo sono mostrati sulla stessa riga. T1, T2 e Stop vengono
         evidenziati visivamente quando risultano raggiunti. Il controllo usa dati Yahoo Finance e può quindi essere
         ritardato: non è un feed tick-by-tick professionale.
         """
