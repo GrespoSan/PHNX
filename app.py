@@ -18,7 +18,7 @@ import yfinance as yf
 from supabase import create_client, Client
 
 APP_NAME = "G. Signal Tracker"
-APP_VERSION = "V2.0"
+APP_VERSION = "V2.1"
 BUCKET_NAME = "signal-screenshots"
 LOCAL_TZ = ZoneInfo("Europe/Rome")
 
@@ -836,7 +836,7 @@ def format_target_distance(row: Dict[str, Any], current_price: Optional[float]) 
     label, points, pct = active_target_distance(row, current_price)
     if not label or points is None or pct is None:
         return "—"
-    return f"{label}: {fmt_num(points)} pt · {pct:.2f}%"
+    return f"{label}: {float(points):.1f} pt · {pct:.2f}%"
 
 
 def open_trade_status_label(row: Dict[str, Any]) -> str:
@@ -1029,7 +1029,7 @@ def styled_signals_dataframe(df: pd.DataFrame, quotes: Optional[Dict[str, float]
             ticker = str(raw.get("ticker") or "")
             price = quotes.get(ticker)
             if price is not None:
-                display.at[idx, "Prezzo attuale"] = fmt_num(price)
+                display.at[idx, "Prezzo attuale"] = f"{float(price):.1f}"
                 display.at[idx, "Dist. target"] = format_target_distance(raw, price)
 
     # Sposta prezzo e distanza immediatamente prima dello Stato.
