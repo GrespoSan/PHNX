@@ -18,7 +18,7 @@ import yfinance as yf
 from supabase import create_client, Client
 
 APP_NAME = "G. Signal Tracker"
-APP_VERSION = "V2.7"
+APP_VERSION = "V2.6"
 BUCKET_NAME = "signal-screenshots"
 LOCAL_TZ = ZoneInfo("Europe/Rome")
 
@@ -966,6 +966,20 @@ def update_all_open_trades() -> Tuple[int, List[str]]:
 # UI helpers
 # -----------------------------------------------------------------------------
 
+STATUS_DISPLAY = {
+    "PUBBLICATO": "IDEA / IN ATTESA",
+    "IN TRADE": "TRADE ATTIVATO",
+    "T1 RAGGIUNTO": "TRADE ATTIVATO · T1",
+    "NESSUN TRADE": "NON ATTIVATO",
+    "ANNULLATO": "ANNULLATO",
+    "CHIUSO": "CHIUSO",
+    "AMBIGUO": "DA VERIFICARE",
+}
+
+def operational_status_label(value: Any) -> str:
+    raw = str(value or "—")
+    return STATUS_DISPLAY.get(raw, raw)
+
 def dataframe_for_display(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
@@ -979,6 +993,8 @@ def dataframe_for_display(df: pd.DataFrame) -> pd.DataFrame:
         out["outcome"] = out["outcome"].map(
             lambda x: "—" if x is None or pd.isna(x) or str(x) in {"None", "T1 APERTO"} else str(x)
         )
+    if "status" in out.columns:
+        out["status"] = out["status"].map(operational_status_label)
     cols = [
         "id", "valid_date", "instrument", "direction", "e1", "e2", "t1", "t2",
         "setup_origin", "confirmations", "actual_entry", "actual_stop", "status", "outcome",
@@ -1229,6 +1245,11 @@ def page_new_signal() -> None:
             if cols[i % 4].checkbox(name, key=f"new_conf_{i}"):
                 confirmations.append(name)
         notes = st.text_area("Note / motivazione del setup", placeholder="Scrivi solo se serve. Campo facoltativo.")
+        distinct_signal = st.checkbox(
+            "È un nuovo segnale distinto anche se esiste già lo stesso strumento/direzione nella stessa giornata",
+            value=False,
+            help="Lascia deselezionato normalmente. Serve solo quando la sala pubblica davvero più setup separati sullo stesso strumento nella stessa giornata.",
+        )
         submitted = st.form_submit_button("💾 Salva segnale", type="primary", use_container_width=True)
 
     if submitted:
@@ -1240,6 +1261,27 @@ def page_new_signal() -> None:
         if errors:
             st.error("Campi necessari mancanti: " + ", ".join(errors))
             return
+
+        # Protezione contro gli aggiornamenti salvati per errore come nuovi segnali.
+        # Non altera il segnale originale già archiviato: invita a correggere/aggiornare quello esistente.
+        try:
+            existing = load_signals()
+            if not existing.empty:
+                same = existing[
+                    (existing["valid_date"].astype(str) == valid_date.isoformat())
+                    & (existing["instrument"].fillna("").astype(str).str.upper().str.strip() == instrument.strip().upper())
+                    & (existing["direction"].fillna("").astype(str).str.upper().str.strip() == direction.strip().upper())
+                ]
+                if not same.empty and not distinct_signal:
+                    existing_id = int(same.iloc[0]["id"])
+                    st.warning(
+                        f"Possibile aggiornamento del segnale #{existing_id}: esiste già {instrument.strip()} {direction} "
+                        f"per {valid_date.isoformat()}. Non ho creato un duplicato. Apri il segnale esistente dalla Dashboard/Archivio; "
+                        "se invece è davvero un nuovo setup distinto, seleziona la conferma dedicata e salva di nuovo."
+                    )
+                    return
+        except Exception as e:
+            st.warning(f"Controllo duplicati non disponibile: {e}")
 
         screenshot_path = ""
         try:
@@ -1494,6 +1536,11 @@ def page_archive() -> None:
                 key=f"open_img_archive_{sid}",
             )
             edit_signal_panel(row, key_prefix="archive")
+            with st.expander("Dettaglio completo", expanded=False):
+                clean = {k: v for k, v in row.items() if k not in {"ocr_text", "created_by", "updated_by"}}
+                st.json(clean, expanded=False)
+                if row.get("ocr_text"):
+                    st.code(row["ocr_text"])
 
 
 def page_users() -> None:
@@ -1572,11 +1619,22 @@ def page_info() -> None:
         """
         **Principio operativo**
 
-        - **Contesto**: Balance / Punto di svolta / Revolving Door, con eventuali conferme facoltative.
+        - **Contesto**: Balance / Punto di svolta / entrambi, con eventuali conferme facoltative.
         - **Segnale originale**: E1/E2 e S1/S2 sono riferimenti indicativi definiti prima della giornata operativa.
         - **Trade reale**: Entry effettiva e Stop effettivo vengono registrati quando la dinamica del mercato dà l'ingresso.
         - **Nessun trade**: se non compare un ingresso valido, il segnale non viene classificato come perdita.
         - **Statistiche**: vengono separate la qualità dell'idea iniziale e l'efficacia dei trade realmente eseguiti.
+
+        **Persistenza e collaborazione**
+
+        Dalla V1.3 segnali e screenshot vengono conservati in **Supabase**. Un reboot o un nuovo deploy di Streamlit
+        non cancella più l'archivio. Gli utenti hanno ruoli separati: Amministratore, Collaboratore e Solo lettura.
+
+        **Dashboard operativa V1.9**
+
+        In Dashboard è disponibile il controllo automatico ogni 60 secondi dei trade aperti. Prezzo attuale e distanza dal target attivo sono mostrati sulla stessa riga. T1, T2 e Stop vengono
+        evidenziati visivamente quando risultano raggiunti. Selezionando una riga puoi modificare il segnale o aprire il grafico allegato senza una sezione separata di gestione trade. Il controllo usa dati Yahoo Finance e può quindi essere
+        ritardato: non è un feed tick-by-tick professionale.
         """
     )
 
