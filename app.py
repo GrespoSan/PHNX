@@ -19,7 +19,7 @@ import yfinance as yf
 from supabase import create_client, Client
 
 APP_NAME = "G. Signal Tracker"
-APP_VERSION = "V3.2"
+APP_VERSION = "V3.3"
 BUCKET_NAME = "signal-screenshots"
 LOCAL_TZ = ZoneInfo("Europe/Rome")
 
@@ -1539,7 +1539,7 @@ def dashboard_live_panel(auto_monitor: bool) -> None:
     )
     st.markdown(
         "<div style='font-weight:800; color:#ffb347; text-transform:uppercase; margin-top:0.20rem; margin-bottom:0.15rem;'>"
-        "⬆️ SELEZIONA IL RIQUADRO ☐ A SINISTRA DELLA RIGA PER MOSTRARE I COMANDI MODIFICA E APRI GRAFICO ALLEGATO."
+        "⬆️ SELEZIONA IL RIQUADRO ☐ A SINISTRA DELLA RIGA PER MOSTRARE I COMANDI MODIFICA E APRI GRAFICO SCREENSHOT ORIGINALE."
         "</div>",
         unsafe_allow_html=True,
     )
@@ -1569,7 +1569,7 @@ def dashboard_live_panel(auto_monitor: bool) -> None:
                 if cols[0].button("✏️ Modifica", key=f"dashboard_edit_{sid}", use_container_width=True):
                     edit_signal_dialog(sid)
                 if cols[1].button(
-                    "🖼️ Apri grafico allegato", key=f"dashboard_image_{sid}",
+                    "🖼️ Apri grafico Screenshot originale", key=f"dashboard_image_{sid}",
                     use_container_width=True, disabled=not bool(selected_raw.get("screenshot_path")),
                 ):
                     open_signal_image_dialog(
@@ -1584,7 +1584,7 @@ def dashboard_live_panel(auto_monitor: bool) -> None:
             else:
                 cols = st.columns(2 if concluded and selected_raw.get("final_screenshot_path") else 1)
                 if cols[0].button(
-                    "🖼️ Apri grafico allegato", key=f"dashboard_image_view_{sid}",
+                    "🖼️ Apri grafico Screenshot originale", key=f"dashboard_image_view_{sid}",
                     use_container_width=True, disabled=not bool(selected_raw.get("screenshot_path")),
                 ):
                     open_signal_image_dialog(
