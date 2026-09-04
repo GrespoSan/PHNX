@@ -19,7 +19,7 @@ import yfinance as yf
 from supabase import create_client, Client
 
 APP_NAME = "G. Signal Tracker"
-APP_VERSION = "V3.1"
+APP_VERSION = "V3.2"
 BUCKET_NAME = "signal-screenshots"
 LOCAL_TZ = ZoneInfo("Europe/Rome")
 
@@ -1086,6 +1086,7 @@ def styled_signals_dataframe(df: pd.DataFrame, quotes: Optional[Dict[str, float]
 
     quotes = quotes or {}
     display["Prezzo attuale"] = "—"
+    display["TradingView"] = ""
     display["Dist. target"] = "—"
 
     raw_by_id: Dict[int, Dict[str, Any]] = {}
@@ -1113,6 +1114,9 @@ def styled_signals_dataframe(df: pd.DataFrame, quotes: Optional[Dict[str, float]
             display.at[idx, "Esito"] = "—"
 
         ticker = effective_yahoo_ticker(raw)
+        tv_url = tradingview_chart_url(raw)
+        if tv_url:
+            display.at[idx, "TradingView"] = tv_url
         price = quotes.get(ticker) if ticker else None
         if price is not None:
             # Il prezzo corrente è utile anche quando il segnale è ancora IDEA / IN ATTESA.
@@ -1120,13 +1124,14 @@ def styled_signals_dataframe(df: pd.DataFrame, quotes: Optional[Dict[str, float]
             if status in {"IN TRADE", "T1 RAGGIUNTO"}:
                 display.at[idx, "Dist. target"] = format_target_distance(raw, price)
 
-    # La distanza resta vicino allo Stato; il prezzo attuale viene messo alla fine della riga.
+    # La distanza resta vicino allo Stato; prezzo attuale e collegamento TradingView
+    # vengono messi alla fine, uno accanto all'altro.
     ordered = list(display.columns)
-    for col in ["Prezzo attuale", "Dist. target"]:
+    for col in ["Prezzo attuale", "TradingView", "Dist. target"]:
         ordered.remove(col)
     insert_at = ordered.index("Stato") if "Stato" in ordered else len(ordered)
     ordered.insert(insert_at, "Dist. target")
-    ordered.append("Prezzo attuale")
+    ordered.extend(["Prezzo attuale", "TradingView"])
     display = display[ordered]
 
     def style_row(row: pd.Series) -> List[str]:
@@ -1523,6 +1528,14 @@ def dashboard_live_panel(auto_monitor: bool) -> None:
         key="dashboard_signals_table",
         on_select="rerun",
         selection_mode="single-row",
+        column_config={
+            "TradingView": st.column_config.LinkColumn(
+                "TV",
+                help="Apri direttamente il grafico dello strumento su TradingView",
+                display_text="📊 Apri",
+                width="small",
+            )
+        },
     )
     st.markdown(
         "<div style='font-weight:800; color:#ffb347; text-transform:uppercase; margin-top:0.20rem; margin-bottom:0.15rem;'>"
@@ -1582,19 +1595,8 @@ def dashboard_live_panel(auto_monitor: bool) -> None:
                     if cols[1].button("📸 Apri screenshot finale", key=f"dashboard_final_view_{sid}", use_container_width=True):
                         final_screenshot_dialog(sid)
 
-            # Collegamenti esterni al grafico corrente dello strumento selezionato.
-            yahoo_url = yahoo_chart_url(selected_raw)
-            tv_url = tradingview_chart_url(selected_raw)
-            link_cols = st.columns(2)
-            if yahoo_url:
-                link_cols[0].link_button("📈 Apri grafico Yahoo", yahoo_url, use_container_width=True)
-            else:
-                link_cols[0].button("📈 Grafico Yahoo non disponibile", disabled=True, use_container_width=True, key=f"yahoo_missing_{sid}")
-            if tv_url:
-                link_cols[1].link_button("📊 Apri grafico TradingView", tv_url, use_container_width=True)
-            else:
-                link_cols[1].button("📊 TradingView non configurato", disabled=True, use_container_width=True, key=f"tv_missing_{sid}")
-                st.caption("Per TradingView serve una corrispondenza tra ticker Yahoo e simbolo TradingView; i principali futures sono già configurati.")
+            # Il grafico TradingView è apribile direttamente dalla colonna TV della tabella,
+            # senza dover selezionare la riga o entrare in modifica.
     st.download_button(
         "⬇️ Esporta storico Excel", data=excel_bytes(df),
         file_name=f"signal_tracker_{local_now().date().isoformat()}.xlsx",
