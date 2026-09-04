@@ -19,7 +19,7 @@ import yfinance as yf
 from supabase import create_client, Client
 
 APP_NAME = "G. Signal Tracker"
-APP_VERSION = "V3.3"
+APP_VERSION = "V3.5"
 BUCKET_NAME = "signal-screenshots"
 LOCAL_TZ = ZoneInfo("Europe/Rome")
 
@@ -384,14 +384,47 @@ def extract_tag_value(text: str, tag: str) -> Optional[float]:
     return normalize_number(m.group(1)) if m else None
 
 
-def infer_instrument(top_text: str, full_text: str) -> Tuple[str, str]:
-    txt = (top_text + "\n" + full_text).lower()
-    for key in sorted(INSTRUMENT_ALIASES, key=len, reverse=True):
-        if re.search(r"(?<![a-z0-9])" + re.escape(key) + r"(?![a-z0-9])", txt):
+def _normalize_instrument_text(value: Any) -> str:
+    """Normalizza punteggiatura/spazi OCR per riconoscere in modo robusto gli strumenti."""
+    s = str(value or "").lower()
+    s = s.replace("’", "'").replace("`", "'").replace("´", "'")
+    s = re.sub(r"[^a-z0-9]+", " ", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _known_instrument_from_text(value: Any) -> Optional[Tuple[str, str]]:
+    txt = _normalize_instrument_text(value)
+    if not txt:
+        return None
+    ordered = sorted(
+        INSTRUMENT_ALIASES,
+        key=lambda k: len(_normalize_instrument_text(k)),
+        reverse=True,
+    )
+    for key in ordered:
+        key_norm = _normalize_instrument_text(key)
+        if not key_norm:
+            continue
+        if re.search(r"(?<![a-z0-9])" + re.escape(key_norm) + r"(?![a-z0-9])", txt):
             return INSTRUMENT_ALIASES[key]
+    return None
+
+
+def canonical_instrument_label(value: Any) -> str:
+    """Ripulisce anche vecchi record OCR già salvati, senza alterare il database."""
+    found = _known_instrument_from_text(value)
+    return found[0] if found else str(value or "").strip()
+
+
+def infer_instrument(top_text: str, full_text: str) -> Tuple[str, str]:
+    combined = top_text + "\n" + full_text
+    found = _known_instrument_from_text(combined)
+    if found:
+        return found
     for line in top_text.splitlines():
         clean = line.strip()
         if clean and len(clean) >= 3 and "tradingview" not in clean.lower():
+            clean = re.split(r"\s+[·|]\s+", clean, maxsplit=1)[0].strip()
             return clean[:80], ""
     return "", ""
 
@@ -480,7 +513,10 @@ def insert_signal(data: Dict[str, Any]) -> int:
 def load_signals() -> pd.DataFrame:
     res = user_client().table("signals").select("*").order("valid_date", desc=True).order("id", desc=True).execute()
     rows = res.data or []
-    return pd.DataFrame(rows)
+    df = pd.DataFrame(rows)
+    if not df.empty and "instrument" in df.columns:
+        df["instrument"] = df["instrument"].map(canonical_instrument_label)
+    return df
 
 
 def load_signal(signal_id: int) -> Optional[Dict[str, Any]]:
@@ -554,7 +590,7 @@ def _edit_signal_body(row: Dict[str, Any], key_prefix: str) -> None:
         except Exception:
             current_date = local_now().date()
         valid_date_edit = c1.date_input("Data di validità", value=current_date, key=f"{key_prefix}_date_{sid}")
-        instrument_edit = c2.text_input("Strumento", value=str(row.get("instrument") or ""), key=f"{key_prefix}_instr_{sid}")
+        instrument_edit = c2.text_input("Strumento", value=canonical_instrument_label(row.get("instrument")), key=f"{key_prefix}_instr_{sid}")
         direction_edit = c3.selectbox(
             "Direzione", ["LONG", "SHORT"],
             index=_option_index(["LONG", "SHORT"], row.get("direction")),
@@ -736,11 +772,8 @@ def effective_yahoo_ticker(row: Dict[str, Any]) -> str:
     stored = str(row.get("ticker") or "").strip()
     if stored:
         return stored
-    name = str(row.get("instrument") or "").lower()
-    for key in sorted(INSTRUMENT_ALIASES, key=len, reverse=True):
-        if key in name:
-            return INSTRUMENT_ALIASES[key][1]
-    return ""
+    found = _known_instrument_from_text(row.get("instrument"))
+    return found[1] if found else ""
 
 
 def yahoo_chart_url(row: Dict[str, Any]) -> str:
@@ -1055,6 +1088,8 @@ def dataframe_for_display(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
     out = df.copy()
+    if "instrument" in out.columns:
+        out["instrument"] = out["instrument"].map(canonical_instrument_label)
     for c in ["e1", "s1", "e2", "s2", "t1", "t2", "actual_entry", "actual_stop"]:
         if c in out.columns:
             out[c] = out[c].map(lambda x: "—" if pd.isna(x) else fmt_num(x))
@@ -1148,8 +1183,6 @@ def styled_signals_dataframe(df: pd.DataFrame, quotes: Optional[Dict[str, float]
             if col in row.index:
                 styles[row.index.get_loc(col)] = css
 
-        if raw.get("t1_hit_time"):
-            set_style("T1", "background-color: #1f6f3d; color: white; font-weight: 700;")
         if raw.get("t2_hit_time"):
             set_style("T2", "background-color: #0b7a3b; color: white; font-weight: 700;")
         if raw.get("stop_hit_time"):
