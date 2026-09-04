@@ -7,6 +7,7 @@ import shutil
 from datetime import datetime, date, timedelta
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple
+from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -18,7 +19,7 @@ import yfinance as yf
 from supabase import create_client, Client
 
 APP_NAME = "G. Signal Tracker"
-APP_VERSION = "V3.0"
+APP_VERSION = "V3.1"
 BUCKET_NAME = "signal-screenshots"
 LOCAL_TZ = ZoneInfo("Europe/Rome")
 
@@ -99,6 +100,37 @@ INSTRUMENT_ALIASES = {
     "6a": ("AUSTRALIAN DOLLAR FUTURES", "6A=F"),
     "japanese yen": ("JAPANESE YEN FUTURES", "6J=F"),
     "6j": ("JAPANESE YEN FUTURES", "6J=F"),
+    "futures t-note'10 anni": ("10Y T-NOTE FUTURES", "ZN=F"),
+    "t-note'10 anni": ("10Y T-NOTE FUTURES", "ZN=F"),
+    "t-note 10 anni": ("10Y T-NOTE FUTURES", "ZN=F"),
+    "10-year t-note": ("10Y T-NOTE FUTURES", "ZN=F"),
+    "10 year t-note": ("10Y T-NOTE FUTURES", "ZN=F"),
+    "10y t-note": ("10Y T-NOTE FUTURES", "ZN=F"),
+    "t-note": ("10Y T-NOTE FUTURES", "ZN=F"),
+    "zn": ("10Y T-NOTE FUTURES", "ZN=F"),
+}
+
+TRADINGVIEW_SYMBOL_BY_YAHOO = {
+    "GC=F": "COMEX:GC1!",
+    "NQ=F": "CME_MINI:NQ1!",
+    "ES=F": "CME_MINI:ES1!",
+    "YM=F": "CBOT_MINI:YM1!",
+    "RTY=F": "CME_MINI:RTY1!",
+    "CL=F": "NYMEX:CL1!",
+    "SI=F": "COMEX:SI1!",
+    "HG=F": "COMEX:HG1!",
+    "NG=F": "NYMEX:NG1!",
+    "ZC=F": "CBOT:ZC1!",
+    "ZW=F": "CBOT:ZW1!",
+    "ZS=F": "CBOT:ZS1!",
+    "6E=F": "CME:6E1!",
+    "6B=F": "CME:6B1!",
+    "6A=F": "CME:6A1!",
+    "6J=F": "CME:6J1!",
+    "ZN=F": "CBOT:ZN1!",
+    "ZB=F": "CBOT:ZB1!",
+    "ZF=F": "CBOT:ZF1!",
+    "ZT=F": "CBOT:ZT1!",
 }
 
 
@@ -699,6 +731,32 @@ def edit_signal_dialog(signal_id: int) -> None:
 # Dati mercato / monitoraggio trade
 # -----------------------------------------------------------------------------
 
+def effective_yahoo_ticker(row: Dict[str, Any]) -> str:
+    """Usa il ticker salvato; se manca prova a ricavarlo dal nome strumento."""
+    stored = str(row.get("ticker") or "").strip()
+    if stored:
+        return stored
+    name = str(row.get("instrument") or "").lower()
+    for key in sorted(INSTRUMENT_ALIASES, key=len, reverse=True):
+        if key in name:
+            return INSTRUMENT_ALIASES[key][1]
+    return ""
+
+
+def yahoo_chart_url(row: Dict[str, Any]) -> str:
+    ticker = effective_yahoo_ticker(row)
+    return f"https://finance.yahoo.com/chart/{quote(ticker, safe='')}" if ticker else ""
+
+
+def tradingview_symbol(row: Dict[str, Any]) -> str:
+    ticker = effective_yahoo_ticker(row)
+    return TRADINGVIEW_SYMBOL_BY_YAHOO.get(ticker, "")
+
+
+def tradingview_chart_url(row: Dict[str, Any]) -> str:
+    symbol = tradingview_symbol(row)
+    return f"https://www.tradingview.com/chart/?symbol={quote(symbol, safe='')}" if symbol else ""
+
 @st.cache_data(ttl=55, show_spinner=False)
 def get_current_price(ticker: str) -> Tuple[Optional[float], str]:
     if not ticker:
@@ -1054,19 +1112,21 @@ def styled_signals_dataframe(df: pd.DataFrame, quotes: Optional[Dict[str, float]
             # Compatibilità con record salvati dalle versioni precedenti.
             display.at[idx, "Esito"] = "—"
 
-        if status in {"IN TRADE", "T1 RAGGIUNTO"}:
-            ticker = str(raw.get("ticker") or "")
-            price = quotes.get(ticker)
-            if price is not None:
-                display.at[idx, "Prezzo attuale"] = f"{float(price):.1f}"
+        ticker = effective_yahoo_ticker(raw)
+        price = quotes.get(ticker) if ticker else None
+        if price is not None:
+            # Il prezzo corrente è utile anche quando il segnale è ancora IDEA / IN ATTESA.
+            display.at[idx, "Prezzo attuale"] = f"{float(price):.1f}"
+            if status in {"IN TRADE", "T1 RAGGIUNTO"}:
                 display.at[idx, "Dist. target"] = format_target_distance(raw, price)
 
-    # Sposta prezzo e distanza immediatamente prima dello Stato.
+    # La distanza resta vicino allo Stato; il prezzo attuale viene messo alla fine della riga.
     ordered = list(display.columns)
     for col in ["Prezzo attuale", "Dist. target"]:
         ordered.remove(col)
     insert_at = ordered.index("Stato") if "Stato" in ordered else len(ordered)
-    ordered[insert_at:insert_at] = ["Prezzo attuale", "Dist. target"]
+    ordered.insert(insert_at, "Dist. target")
+    ordered.append("Prezzo attuale")
     display = display[ordered]
 
     def style_row(row: pd.Series) -> List[str]:
@@ -1114,15 +1174,22 @@ def styled_signals_dataframe(df: pd.DataFrame, quotes: Optional[Dict[str, float]
 
 
 def dashboard_quotes(df: pd.DataFrame, allow_fetch: bool) -> Dict[str, float]:
+    """Prezzi per tutti i segnali ancora attivi: idea, trade aperto e T1 già raggiunto."""
     quotes: Dict[str, float] = {}
     if df.empty:
         return quotes
-    open_df = df[df["status"].isin(["IN TRADE", "T1 RAGGIUNTO"])] if "status" in df else pd.DataFrame()
-    if open_df.empty:
+    active_statuses = {"PUBBLICATO", "IN TRADE", "T1 RAGGIUNTO"}
+    active_df = df[df["status"].isin(active_statuses)] if "status" in df else pd.DataFrame()
+    if active_df.empty:
         return quotes
-    for ticker in open_df.get("ticker", pd.Series(dtype=str)).dropna().astype(str).unique().tolist():
-        if not ticker:
-            continue
+
+    tickers: List[str] = []
+    for _, r in active_df.iterrows():
+        ticker = effective_yahoo_ticker(r.to_dict())
+        if ticker and ticker not in tickers:
+            tickers.append(ticker)
+
+    for ticker in tickers:
         price, _, _ = get_market_quote(ticker, allow_fetch=allow_fetch)
         if price is not None:
             quotes[ticker] = float(price)
@@ -1448,7 +1515,7 @@ def dashboard_live_panel(auto_monitor: bool) -> None:
     if notes:
         st.warning("\n".join(notes))
 
-    quotes = dashboard_quotes(df, allow_fetch=not (auto_monitor and can_write()))
+    quotes = dashboard_quotes(df, allow_fetch=True)
     table_event = st.dataframe(
         styled_signals_dataframe(df, quotes),
         use_container_width=True,
@@ -1514,6 +1581,20 @@ def dashboard_live_panel(auto_monitor: bool) -> None:
                 if concluded and selected_raw.get("final_screenshot_path"):
                     if cols[1].button("📸 Apri screenshot finale", key=f"dashboard_final_view_{sid}", use_container_width=True):
                         final_screenshot_dialog(sid)
+
+            # Collegamenti esterni al grafico corrente dello strumento selezionato.
+            yahoo_url = yahoo_chart_url(selected_raw)
+            tv_url = tradingview_chart_url(selected_raw)
+            link_cols = st.columns(2)
+            if yahoo_url:
+                link_cols[0].link_button("📈 Apri grafico Yahoo", yahoo_url, use_container_width=True)
+            else:
+                link_cols[0].button("📈 Grafico Yahoo non disponibile", disabled=True, use_container_width=True, key=f"yahoo_missing_{sid}")
+            if tv_url:
+                link_cols[1].link_button("📊 Apri grafico TradingView", tv_url, use_container_width=True)
+            else:
+                link_cols[1].button("📊 TradingView non configurato", disabled=True, use_container_width=True, key=f"tv_missing_{sid}")
+                st.caption("Per TradingView serve una corrispondenza tra ticker Yahoo e simbolo TradingView; i principali futures sono già configurati.")
     st.download_button(
         "⬇️ Esporta storico Excel", data=excel_bytes(df),
         file_name=f"signal_tracker_{local_now().date().isoformat()}.xlsx",
