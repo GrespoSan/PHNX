@@ -19,7 +19,7 @@ import yfinance as yf
 from supabase import create_client, Client
 
 APP_NAME = "G. Signal Tracker"
-APP_VERSION = "V3.8"
+APP_VERSION = "V3.9"
 BUCKET_NAME = "signal-screenshots"
 LOCAL_TZ = ZoneInfo("Europe/Rome")
 
@@ -876,13 +876,17 @@ def _edit_signal_body(row: Dict[str, Any], key_prefix: str) -> None:
             "ticker": ticker_edit.strip(),
             "direction": direction_edit,
             "e1": e1_edit, "s1": s1_edit, "e2": e2_edit, "s2": s2_edit,
-            "t1": t1_edit, "t2": t2_edit, "t3": t3_edit,
+            "t1": t1_edit, "t2": t2_edit,
             "setup_origin": setup_origin_edit,
             "reference_area": reference_area_edit.strip(),
             "setup_timeframe": setup_tf_edit,
             "confirmations": confirmations_edit,
             "notes": notes_edit.strip(),
         }
+        # T3 è raro e opzionale: se non è attivo non inviamo alcun campo T3 al database.
+        # In questo modo l'app resta compatibile anche con database non ancora migrati.
+        if use_t3_edit or _numeric_or_none(row.get("t3")) is not None:
+            updates["t3"] = t3_edit
 
         monitoring_changed = False
         if has_real_trade or trade_started_now:
@@ -913,11 +917,12 @@ def _edit_signal_body(row: Dict[str, Any], key_prefix: str) -> None:
                 "outcome": None,
                 "t1_hit_time": None,
                 "t2_hit_time": None,
-                "t3_hit_time": None,
                 "stop_hit_time": None,
                 "result_note": "Ingresso/dati trade registrati o corretti; monitoraggio da ricalcolare",
                 "last_check": None,
             })
+            if use_t3_edit or _numeric_or_none(row.get("t3")) is not None:
+                updates["t3_hit_time"] = None
 
         try:
             update_signal(sid, **updates)
@@ -929,7 +934,11 @@ def _edit_signal_body(row: Dict[str, Any], key_prefix: str) -> None:
                 st.success("Modifiche salvate.")
             st.rerun()
         except Exception as e:
-            st.error(f"Modifica non riuscita: {e}")
+            msg = str(e)
+            if "PGRST204" in msg and ("t3" in msg.lower() or "t3_hit_time" in msg.lower()):
+                st.error("T3 richiede la migration Supabase V3.7 (colonne t3 e t3_hit_time). Se non usi T3, lascia disattivato il flag Usa T3.")
+            else:
+                st.error(f"Modifica non riuscita: {e}")
 
     if not has_real_trade and str(row.get("status") or "") == "PUBBLICATO":
         st.divider()
@@ -1291,17 +1300,20 @@ def update_all_open_trades() -> Tuple[int, List[str]]:
             continue
         try:
             res = evaluate_trade(row)
-            update_signal(
-                int(row["id"]),
-                status=res.get("status") or row.get("status"),
-                outcome=res.get("outcome"),
-                t1_hit_time=res.get("t1_hit_time"),
-                t2_hit_time=res.get("t2_hit_time"),
-                t3_hit_time=res.get("t3_hit_time"),
-                stop_hit_time=res.get("stop_hit_time"),
-                result_note=res.get("note", ""),
-                last_check=now_iso(),
-            )
+            update_kwargs = {
+                "status": res.get("status") or row.get("status"),
+                "outcome": res.get("outcome"),
+                "t1_hit_time": res.get("t1_hit_time"),
+                "t2_hit_time": res.get("t2_hit_time"),
+                "stop_hit_time": res.get("stop_hit_time"),
+                "result_note": res.get("note", ""),
+                "last_check": now_iso(),
+            }
+            # Non tocchiamo t3_hit_time se questo trade non usa T3.
+            # Evita errori PGRST204 sui database che non hanno ancora la migration T3.
+            if _numeric_or_none(row.get("t3")) is not None:
+                update_kwargs["t3_hit_time"] = res.get("t3_hit_time")
+            update_signal(int(row["id"]), **update_kwargs)
             updated += 1
         except Exception as e:
             notes.append(f"#{int(r['id'])}: {e}")
@@ -1761,12 +1773,12 @@ def page_new_signal() -> None:
         try:
             with st.spinner("Salvataggio permanente in corso..."):
                 screenshot_path = upload_screenshot(uploaded)
-                signal_id = insert_signal({
+                payload = {
                     "valid_date": valid_date.isoformat(),
                     "instrument": instrument.strip(),
                     "ticker": ticker.strip(),
                     "direction": direction,
-                    "e1": e1, "s1": s1, "e2": e2, "s2": s2, "t1": t1, "t2": t2, "t3": t3,
+                    "e1": e1, "s1": s1, "e2": e2, "s2": s2, "t1": t1, "t2": t2,
                     "setup_origin": setup_origin,
                     "reference_area": reference_area.strip(),
                     "setup_timeframe": setup_tf,
@@ -1774,14 +1786,21 @@ def page_new_signal() -> None:
                     "notes": notes.strip(),
                     "screenshot_path": screenshot_path,
                     "ocr_text": (ocr.get("top_text", "") + "\n" + ocr.get("full_text", "")).strip(),
-                })
+                }
+                if use_t3:
+                    payload["t3"] = t3
+                signal_id = insert_signal(payload)
             st.success(f"Segnale #{signal_id} salvato in modo persistente.")
             st.session_state["ocr_hash"] = None
             st.session_state["ocr_data"] = None
         except Exception as e:
             if screenshot_path:
                 remove_screenshot(screenshot_path)
-            st.error(f"Salvataggio non riuscito: {e}")
+            msg = str(e)
+            if "PGRST204" in msg and ("t3" in msg.lower() or "t3_hit_time" in msg.lower()):
+                st.error("T3 richiede la migration Supabase V3.7 (colonne t3 e t3_hit_time). Se non usi T3, lascia disattivato il flag Usa T3.")
+            else:
+                st.error(f"Salvataggio non riuscito: {e}")
 
     if ocr.get("full_text"):
         with st.expander("Testo letto dall'OCR"):
