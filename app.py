@@ -20,7 +20,7 @@ import yfinance as yf
 from supabase import create_client, Client
 
 APP_NAME = "G. Signal Tracker"
-APP_VERSION = "V4.7"
+APP_VERSION = "V4.8"
 BUCKET_NAME = "signal-screenshots"
 LOCAL_TZ = ZoneInfo("Europe/Rome")
 
@@ -934,6 +934,87 @@ def _parse_timeframe_text(text: str) -> str:
     return "—"
 
 
+def _table_cell_box(
+    bbox: Tuple[int, int, int, int], row_idx: int, col_idx: int,
+    pad_x: int = 2, pad_y: int = 2,
+) -> Tuple[int, int, int, int]:
+    """Coordinate di una cella del template 7x4, relative al bbox dinamico della tabella.
+
+    La tabella può essere spostata ovunque nel grafico: cambiano le coordinate assolute,
+    non la struttura interna. Le proporzioni delle colonne derivano dal template usato
+    negli screenshot attuali.
+    """
+    x0, y0, x1, y1 = bbox
+    w = max(1, x1 - x0)
+    h = max(1, y1 - y0)
+    col_edges = (0.00, 0.22, 0.56, 0.91, 1.00)
+    row_edges = tuple(i / 7.0 for i in range(8))
+    cx0 = int(x0 + w * col_edges[col_idx]) + pad_x
+    cx1 = int(x0 + w * col_edges[col_idx + 1]) - pad_x
+    cy0 = int(y0 + h * row_edges[row_idx]) + pad_y
+    cy1 = int(y0 + h * row_edges[row_idx + 1]) - pad_y
+    return (max(x0, cx0), max(y0, cy0), min(x1, cx1), min(y1, cy1))
+
+
+def _ocr_table_numeric_cell(img: Image.Image, bbox: Tuple[int, int, int, int], row_idx: int) -> Optional[float]:
+    """Legge SOLO la cella valore della riga, evitando che M4/X vengano scambiati per numeri."""
+    box = _table_cell_box(bbox, row_idx, 1)
+    crop = ImageOps.grayscale(img.crop(box))
+    if crop.width <= 1 or crop.height <= 1:
+        return None
+    crop = crop.resize((crop.width * 6, crop.height * 6))
+    crop = ImageEnhance.Contrast(crop).enhance(2.5)
+    arr = np.array(crop)
+    bw = Image.fromarray(np.where(arr < 190, 0, 255).astype("uint8"))
+    try:
+        raw = pytesseract.image_to_string(
+            bw, config="--psm 7 -c tessedit_char_whitelist=0123456789.,"
+        ).strip()
+    except Exception:
+        return None
+    m = re.search(r"\d+(?:[.,]\d+)?", raw)
+    return normalize_number(m.group(0)) if m else None
+
+
+def _ocr_table_code_cell(img: Image.Image, bbox: Tuple[int, int, int, int], row_idx: int) -> Optional[str]:
+    """Legge la sigla conferma nella terza colonna della specifica riga."""
+    box = _table_cell_box(bbox, row_idx, 2)
+    crop = ImageOps.grayscale(img.crop(box))
+    if crop.width <= 1 or crop.height <= 1:
+        return None
+    crop = crop.resize((crop.width * 5, crop.height * 5))
+    crop = ImageEnhance.Contrast(crop).enhance(2.5)
+    arr = np.array(crop)
+    bw = Image.fromarray(np.where(arr < 190, 0, 255).astype("uint8"))
+    try:
+        raw = pytesseract.image_to_string(
+            bw,
+            config="--psm 7 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789/.-",
+        ).strip()
+    except Exception:
+        return None
+    return _normalize_confirmation_code_token(raw)
+
+
+def _table_x_is_checked(img: Image.Image, bbox: Tuple[int, int, int, int], row_idx: int) -> bool:
+    """Rileva la X nella quarta colonna della singola riga con OCR dedicato."""
+    box = _table_cell_box(bbox, row_idx, 3, pad_x=1, pad_y=1)
+    crop = ImageOps.grayscale(img.crop(box))
+    if crop.width <= 1 or crop.height <= 1:
+        return False
+    crop = crop.resize((crop.width * 8, crop.height * 8))
+    crop = ImageEnhance.Contrast(crop).enhance(3.0)
+    arr = np.array(crop)
+    bw = Image.fromarray(np.where(arr < 175, 0, 255).astype("uint8"))
+    try:
+        raw = pytesseract.image_to_string(
+            bw, config="--psm 10 -c tessedit_char_whitelist=Xx"
+        ).strip()
+    except Exception:
+        raw = ""
+    return "X" in raw.upper()
+
+
 def _checked_rows_from_table_bbox(img: Image.Image, bbox: Tuple[int, int, int, int]) -> List[str]:
     """Rileva le X nella quarta colonna usando il bbox reale della tabella."""
     arr = np.array(img.convert("RGB"))
@@ -961,25 +1042,42 @@ def _checked_rows_from_table_bbox(img: Image.Image, bbox: Tuple[int, int, int, i
 
 
 def extract_signal_table_data(img: Image.Image) -> Optional[Dict[str, Any]]:
-    """Estrae la nuova tabella in modo posizionale e indipendente dalla sua posizione."""
+    """Estrae la tabella in modo posizionale e indipendente dalla sua posizione.
+
+    V4.8: dopo aver trovato il bbox dinamico, legge ogni cella separatamente. Questo
+    evita errori come E1=4 dovuti a M4/X o ad altre righe vicine nel testo OCR globale.
+    """
     bbox = _detect_signal_table_bbox(img)
     if not bbox:
         return None
+
     table_text = _ocr_signal_table_text(img, bbox)
     segments = _table_row_segments(table_text)
-    if len(segments) < 3:
-        return None
 
-    values = {tag.lower(): _numeric_from_table_segment(lines) for tag, lines in segments.items()}
+    row_index = {"E1": 1, "E2": 2, "T1": 3, "T2": 4, "T3": 5, "STOP": 6}
+    values: Dict[str, Optional[float]] = {}
     row_codes: Dict[str, str] = {}
-    for tag, lines in segments.items():
-        for line in lines:
-            code = _normalize_confirmation_code_token(line)
-            if code and code != "RD":
-                row_codes[tag] = code
-                break
+    checked_rows: List[str] = []
 
-    checked_rows = _checked_rows_from_table_bbox(img, bbox)
+    for tag, idx in row_index.items():
+        # Priorità assoluta alla cella valore dedicata.
+        value = _ocr_table_numeric_cell(img, bbox, idx)
+        if value is None and tag in segments:
+            value = _numeric_from_table_segment(segments[tag])
+        values[tag.lower()] = value
+
+        code = _ocr_table_code_cell(img, bbox, idx)
+        if not code and tag in segments:
+            for line in segments[tag]:
+                code = _normalize_confirmation_code_token(line)
+                if code and code != "RD":
+                    break
+        if code and code != "RD":
+            row_codes[tag] = code
+
+        if _table_x_is_checked(img, bbox, idx):
+            checked_rows.append(tag)
+
     confirmations: List[str] = []
     for row_tag in checked_rows:
         code = row_codes.get(row_tag)
@@ -990,9 +1088,15 @@ def extract_signal_table_data(img: Image.Image) -> Optional[Dict[str, Any]]:
     context_text = _ocr_table_context_text(img, bbox)
     header_text = table_text + "\n" + context_text
     direction_match = re.search(r"\b(LONG|SHORT)\b", header_text, flags=re.I)
-    setup_origin = "Revolving Door" if re.search(r"(?<![A-Z0-9])RD(?![A-Z0-9])", header_text, flags=re.I) else "—"
+
+    # RD è nel terzo campo della riga header; il testo globale resta un fallback.
+    header_code = _ocr_table_code_cell(img, bbox, 0)
+    setup_origin = (
+        "Revolving Door"
+        if header_code == "RD" or re.search(r"(?<![A-Z0-9])RD(?![A-Z0-9])", header_text, flags=re.I)
+        else "—"
+    )
     setup_timeframe = _parse_timeframe_text(context_text)
-    shared_stop = values.get("stop")
 
     return {
         "bbox": bbox,
@@ -1005,7 +1109,7 @@ def extract_signal_table_data(img: Image.Image) -> Optional[Dict[str, Any]]:
         "t1": values.get("t1"),
         "t2": values.get("t2"),
         "t3": values.get("t3"),
-        "shared_stop": shared_stop,
+        "shared_stop": values.get("stop"),
         "setup_origin": setup_origin,
         "setup_timeframe": setup_timeframe,
         "confirmations": confirmations,
@@ -1408,6 +1512,7 @@ def _edit_signal_body(row: Dict[str, Any], key_prefix: str) -> None:
             if str(key_prefix).startswith("dashboard_detail_"):
                 st.session_state["dashboard_flash_message"] = success_message
                 st.session_state["dashboard_table_version"] = int(st.session_state.get("dashboard_table_version", 0)) + 1
+                st.session_state.pop("dashboard_selected_signal_id", None)
             else:
                 st.session_state["edit_flash_message"] = success_message
             st.rerun()
@@ -1468,6 +1573,7 @@ def _edit_signal_body(row: Dict[str, Any], key_prefix: str) -> None:
                     if str(key_prefix).startswith("dashboard_detail_"):
                         st.session_state["dashboard_flash_message"] = message
                         st.session_state["dashboard_table_version"] = int(st.session_state.get("dashboard_table_version", 0)) + 1
+                        st.session_state.pop("dashboard_selected_signal_id", None)
                     else:
                         st.session_state["edit_flash_message"] = message
                     st.rerun()
@@ -1486,11 +1592,13 @@ def _edit_signal_body(row: Dict[str, Any], key_prefix: str) -> None:
             update_signal(sid, status="NESSUN TRADE", outcome="NESSUN TRADE", result_note="Segnale non eseguito")
             if str(key_prefix).startswith("dashboard_detail_"):
                 st.session_state["dashboard_table_version"] = int(st.session_state.get("dashboard_table_version", 0)) + 1
+                st.session_state.pop("dashboard_selected_signal_id", None)
             st.rerun()
         if c2.button("⛔ SETUP ANNULLATO", key=f"{key_prefix}_cancel_{sid}", use_container_width=True):
             update_signal(sid, status="ANNULLATO", outcome="ANNULLATO", result_note="Setup annullato")
             if str(key_prefix).startswith("dashboard_detail_"):
                 st.session_state["dashboard_table_version"] = int(st.session_state.get("dashboard_table_version", 0)) + 1
+                st.session_state.pop("dashboard_selected_signal_id", None)
             st.rerun()
 
 def edit_signal_panel(row: Dict[str, Any], key_prefix: str) -> None:
@@ -2552,32 +2660,35 @@ def render_saved_signal_actions(row: Dict[str, Any], key_prefix: str) -> None:
         return
 
     sid = int(row["id"])
-    cols = st.columns(2 if is_admin() else 1)
+    cols = st.columns(2)
 
     with cols[0]:
         if st.button("🔁 Rileggi screenshot", key=f"{key_prefix}_reread_{sid}", use_container_width=True):
             try:
                 msg = reread_signal_from_storage(sid)
+                # Manteniamo aperto il dettaglio Dashboard dopo la rilettura.
+                if str(key_prefix).startswith("dashboard_detail_"):
+                    st.session_state["dashboard_selected_signal_id"] = sid
                 _set_saved_signal_flash(key_prefix, msg)
                 st.rerun()
             except Exception as e:
                 st.error(f"Rilettura screenshot non riuscita: {e}")
 
-    if is_admin():
-        with cols[1]:
-            confirm_delete = st.checkbox("Confermo eliminazione", key=f"{key_prefix}_confirm_delete_{sid}")
-            if st.button(
-                "🗑️ Elimina segnale",
-                key=f"{key_prefix}_delete_{sid}",
-                use_container_width=True,
-                disabled=not confirm_delete,
-            ):
-                try:
-                    delete_signal_with_assets(sid)
-                    _set_saved_signal_flash(key_prefix, f"Segnale #{sid} eliminato.")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Eliminazione non riuscita: {e}")
+    with cols[1]:
+        confirm_delete = st.checkbox("Confermo eliminazione", key=f"{key_prefix}_confirm_delete_{sid}")
+        if st.button(
+            "🗑️ Elimina segnale",
+            key=f"{key_prefix}_delete_{sid}",
+            use_container_width=True,
+            disabled=not confirm_delete,
+        ):
+            try:
+                delete_signal_with_assets(sid)
+                st.session_state.pop("dashboard_selected_signal_id", None)
+                _set_saved_signal_flash(key_prefix, f"Segnale #{sid} eliminato.")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Eliminazione non riuscita: {e}")
 
 
 def _optional_path(value: Any) -> str:
@@ -2738,8 +2849,15 @@ def dashboard_live_panel(auto_monitor: bool) -> None:
         except Exception:
             pos, column_name = -1, ""
         if column_name == "ID" and 0 <= pos < len(df):
-            selected_raw = df.iloc[pos].to_dict()
-            dashboard_signal_detail(selected_raw, quotes)
+            st.session_state["dashboard_selected_signal_id"] = int(df.iloc[pos]["id"])
+
+    selected_sid = st.session_state.get("dashboard_selected_signal_id")
+    if selected_sid is not None:
+        selected_row = load_signal(int(selected_sid))
+        if selected_row:
+            dashboard_signal_detail(selected_row, quotes)
+        else:
+            st.session_state.pop("dashboard_selected_signal_id", None)
 
     st.download_button(
         "⬇️ Esporta storico Excel", data=excel_bytes(df),
