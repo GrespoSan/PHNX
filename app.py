@@ -20,7 +20,7 @@ import yfinance as yf
 from supabase import create_client, Client
 
 APP_NAME = "G. Signal Tracker"
-APP_VERSION = "V4.3"
+APP_VERSION = "V4.4"
 BUCKET_NAME = "signal-screenshots"
 LOCAL_TZ = ZoneInfo("Europe/Rome")
 
@@ -36,12 +36,22 @@ CONFIRMATIONS = [
     "M4",
     "Divergenze",
     "Stocastico/TDI",
-    "Bollinger",
     "Supertrend",
-    "Price Action",
-    "News",
+    "Fibonacci",
     "Altro",
 ]
+
+# Codici usati nella nuova tabella inserita negli screenshot.
+# La conferma viene attivata SOLO quando accanto al codice è presente una X.
+CONFIRMATION_CODE_MAP = {
+    "RD": "Revolving Door",
+    "STOC/TDI": "Stocastico/TDI",
+    "MM": "Medie mobili",
+    "M4": "M4",
+    "ST": "Supertrend",
+    "DIV": "Divergenze",
+    "FIBO": "Fibonacci",
+}
 
 SETUP_ORIGINS = [
     "—",
@@ -100,6 +110,10 @@ INSTRUMENT_ALIASES = {
     "6a": ("AUSTRALIAN DOLLAR FUTURES", "6A=F"),
     "japanese yen": ("JAPANESE YEN FUTURES", "6J=F"),
     "6j": ("JAPANESE YEN FUTURES", "6J=F"),
+    "swiss franc futures": ("SWISS FRANC FUTURES", "6S=F"),
+    "swiss franc": ("SWISS FRANC FUTURES", "6S=F"),
+    "6s1": ("SWISS FRANC FUTURES", "6S=F"),
+    "6s": ("SWISS FRANC FUTURES", "6S=F"),
     "futures t-note'10 anni": ("10Y T-NOTE FUTURES", "ZN=F"),
     "t-note'10 anni": ("10Y T-NOTE FUTURES", "ZN=F"),
     "t-note 10 anni": ("10Y T-NOTE FUTURES", "ZN=F"),
@@ -136,6 +150,7 @@ TRADINGVIEW_SYMBOL_BY_YAHOO = {
     "6B=F": "CME:6B1!",
     "6A=F": "CME:6A1!",
     "6J=F": "CME:6J1!",
+    "6S=F": "CME:6S1!",
     "ZN=F": "CBOT:ZN1!",
     "ZB=F": "CBOT:ZB1!",
     "ZF=F": "CBOT:ZF1!",
@@ -343,16 +358,23 @@ def preprocess_for_ocr(img: Image.Image, scale: int = 2, contrast: float = 2.3) 
 
 
 def run_ocr(img: Image.Image) -> Tuple[str, str]:
+    """OCR generale + OCR dedicato alla fascia superiore con la nuova tabella.
+
+    La vecchia versione leggeva solo la parte alta SINISTRA e quindi perdeva la tabella
+    che ora si trova in alto a destra. Manteniamo due sole chiamate a Tesseract, ma il
+    secondo passaggio copre tutta la larghezza del grafico e circa il 36% superiore.
+    """
     if not configure_tesseract():
         raise RuntimeError(
             "OCR non disponibile: su Streamlit Community Cloud serve packages.txt con la riga tesseract-ocr."
         )
     full = preprocess_for_ocr(img, scale=2, contrast=2.2)
     full_text = pytesseract.image_to_string(full, config="--psm 11")
-    h = max(90, int(img.height * 0.16))
-    w = max(500, int(img.width * 0.50))
-    top = img.crop((0, 0, min(w, img.width), min(h, img.height)))
-    top = preprocess_for_ocr(top, scale=4, contrast=3.0)
+
+    # Fascia superiore completa: contiene intestazione TradingView + tabella + timeframe.
+    h = max(180, int(img.height * 0.36))
+    top = img.crop((0, 0, img.width, min(h, img.height)))
+    top = preprocess_for_ocr(top, scale=2, contrast=2.4)
     top_text = pytesseract.image_to_string(top, config="--psm 11")
     return full_text, top_text
 
@@ -593,6 +615,188 @@ def extract_tag_value(text: str, tag: str) -> Optional[float]:
     return normalize_number(m.group(1)) if m else None
 
 
+def extract_shared_stop_value(text: str) -> Optional[float]:
+    """Legge la nuova riga singola `Stop 1,23456` della tabella."""
+    m = re.search(r"\bSTOP\b\s*[:=]?\s*([0-9][0-9.,]*)", str(text or ""), flags=re.I)
+    return normalize_number(m.group(1)) if m else None
+
+
+def _confirmation_code_in_line(line: str, code: str) -> bool:
+    """Riconosce il codice conferma senza confondere ST con STOC/TDI."""
+    raw = str(line or "").upper().replace("×", "X")
+    compact = re.sub(r"[^A-Z0-9/]", "", raw)
+    if code == "STOC/TDI":
+        return compact.startswith("STOC/TDI") or compact.startswith("STOCTDI")
+    if code == "DIV":
+        return compact.startswith("DIV")
+    return compact.startswith(code) and (compact == code or compact.startswith(code + "X"))
+
+
+def _line_has_x_after_code(line: str, code: str) -> bool:
+    raw = str(line or "").upper().replace("×", "X")
+    if code == "STOC/TDI":
+        return bool(re.search(r"STOC\s*/?\s*TDI.*?X", raw))
+    if code == "DIV":
+        return bool(re.search(r"DIV\.?\s*.*?X", raw))
+    return bool(re.search(r"(?<![A-Z0-9])" + re.escape(code) + r"(?![A-Z0-9]).*?X", raw))
+
+
+def _is_x_marker(line: str) -> bool:
+    compact = re.sub(r"[^A-Z]", "", str(line or "").upper().replace("×", "X"))
+    return compact in {"X", "XX"}
+
+
+def parse_table_metadata(text: str) -> Dict[str, Any]:
+    """Estrae contesto e conferme dalla nuova tabella in alto nello screenshot.
+
+    Regola fondamentale: una conferma viene selezionata solo se accanto alla relativa
+    sigla è presente una X. RD nella riga intestazione resta invece Origine del setup.
+    """
+    raw = str(text or "")
+    lines = [re.sub(r"\s+", " ", ln.strip()) for ln in raw.splitlines() if ln.strip()]
+
+    # Origine setup: nella nuova tabella RD è nella riga con LONG/SHORT e data.
+    setup_origin = "—"
+    for i, line in enumerate(lines):
+        if re.fullmatch(r"RD\.?", line.upper().strip()):
+            prev = " ".join(lines[max(0, i - 2):i]).upper()
+            if re.search(r"\b(?:LONG|SHORT)\b", prev) or re.search(r"\d{1,2}[./-]\d{1,2}[./-]\d{2,4}", prev):
+                setup_origin = "Revolving Door"
+                break
+    if setup_origin == "—":
+        m = re.search(r"\b(?:LONG|SHORT)\b[\s\S]{0,50}?\d{1,2}[./-]\d{1,2}[./-]\d{2,4}[\s\S]{0,30}?\bRD\b", raw, flags=re.I)
+        if m:
+            setup_origin = "Revolving Door"
+
+    # Timeframe scritto nel box a destra: es. Timeframe 30-Minute.
+    setup_timeframe = "—"
+    tfm = re.search(r"TIME\s*FRAME\s*([0-9]{1,3})\s*[- ]?\s*(MINUTE|MIN|MINUTI|HOUR|H)?", raw, flags=re.I)
+    if not tfm:
+        tfm = re.search(r"TIMEFRAME\s*([0-9]{1,3})\s*[- ]?\s*(MINUTE|MIN|MINUTI|HOUR|H)?", raw, flags=re.I)
+    if tfm:
+        n = int(tfm.group(1))
+        unit = (tfm.group(2) or "MIN").upper()
+        if unit.startswith("H"):
+            setup_timeframe = f"{n}H" if f"{n}H" in TIMEFRAMES else "—"
+        else:
+            setup_timeframe = {15: "15m", 30: "30m", 60: "1H", 120: "2H", 240: "4H"}.get(n, "—")
+
+    confirmations: List[str] = []
+    for i, line in enumerate(lines):
+        for code, label in CONFIRMATION_CODE_MAP.items():
+            if not _confirmation_code_in_line(line, code):
+                continue
+            checked = _line_has_x_after_code(line, code)
+            if not checked and i + 1 < len(lines):
+                checked = _is_x_marker(lines[i + 1])
+            if checked and label not in confirmations:
+                confirmations.append(label)
+
+    return {
+        "setup_origin": setup_origin,
+        "setup_timeframe": setup_timeframe,
+        "confirmations": confirmations,
+    }
+
+
+def _normalize_confirmation_code_token(line: str) -> Optional[str]:
+    """Normalizza le sigle della terza colonna della tabella, tollerando piccoli errori OCR."""
+    compact = re.sub(r"[^A-Z0-9]", "", str(line or "").upper())
+    if not compact:
+        return None
+    if compact.startswith("STOC") or compact in {"STOCTDI", "STOCITD", "STOCTD"}:
+        return "STOC/TDI"
+    if compact == "MM":
+        return "MM"
+    if compact == "M4":
+        return "M4"
+    if compact == "ST":
+        return "ST"
+    if compact.startswith("DIV"):
+        return "DIV"
+    if compact.startswith("FIB"):
+        return "FIBO"
+    if compact == "RD":
+        return "RD"
+    return None
+
+
+def extract_confirmation_codes_by_row(text: str) -> Dict[str, str]:
+    """Associa la sigla conferma alla riga E1/E2/T1/T2/T3/STOP della nuova tabella."""
+    lines = [ln.strip() for ln in str(text or "").splitlines() if ln.strip()]
+    wanted = ["E1", "E2", "T1", "T2", "T3", "STOP"]
+    positions: Dict[str, int] = {}
+    start = 0
+    for tag in wanted:
+        for i in range(start, len(lines)):
+            if re.sub(r"[^A-Z0-9]", "", lines[i].upper()) == tag:
+                positions[tag] = i
+                start = i + 1
+                break
+
+    out: Dict[str, str] = {}
+    ordered_positions = sorted(positions.items(), key=lambda kv: kv[1])
+    for idx, (tag, pos) in enumerate(ordered_positions):
+        next_pos = ordered_positions[idx + 1][1] if idx + 1 < len(ordered_positions) else min(len(lines), pos + 10)
+        for ln in lines[pos + 1:next_pos]:
+            code = _normalize_confirmation_code_token(ln)
+            if code and code != "RD":
+                out[tag] = code
+                break
+    return out
+
+
+def _checked_rows_from_table_image(img: Image.Image) -> List[str]:
+    """Rileva le X nella quarta colonna senza affidarsi all'OCR della lettera X.
+
+    Il nuovo template ha la tabella stabilmente in alto a destra. Usiamo coordinate
+    relative, quindi funziona anche se lo screenshot viene ridimensionato.
+    """
+    arr = np.array(img.convert("RGB"))
+    h, w, _ = arr.shape
+    # Bounding box del riquadro tabella nel nuovo template.
+    x_left, x_right = int(w * 0.632), int(w * 0.826)
+    y_top, y_bottom = int(h * 0.036), int(h * 0.249)
+    if x_right <= x_left or y_bottom <= y_top:
+        return []
+
+    row_labels = ["HEADER", "E1", "E2", "T1", "T2", "T3", "STOP"]
+    # Ultima colonna, dove viene disegnata la X.
+    x0 = int(x_left + (x_right - x_left) * 0.91)
+    x1 = max(x0 + 2, x_right - 2)
+    checked: List[str] = []
+    for r, label in enumerate(row_labels):
+        yy0 = int(y_top + r * (y_bottom - y_top) / len(row_labels)) + 3
+        yy1 = int(y_top + (r + 1) * (y_bottom - y_top) / len(row_labels)) - 3
+        if yy1 <= yy0:
+            continue
+        cell = arr[yy0:yy1, x0:x1]
+        if cell.size == 0:
+            continue
+        rr, gg, bb = cell[:, :, 0], cell[:, :, 1], cell[:, :, 2]
+        # La X è grigio/nera; le linee blu della tabella non passano questo filtro.
+        dark_neutral = (rr < 145) & (gg < 145) & (bb < 145)
+        if label != "HEADER" and int(dark_neutral.sum()) >= 8:
+            checked.append(label)
+    return checked
+
+
+def extract_confirmations_from_table_image(img: Image.Image, ocr_text: str) -> Optional[List[str]]:
+    """Restituisce le conferme spuntate nel nuovo template; None se la tabella non è riconosciuta."""
+    row_codes = extract_confirmation_codes_by_row(ocr_text)
+    # Richiediamo almeno tre righe riconosciute per evitare falsi positivi su vecchi screenshot.
+    if len(row_codes) < 3:
+        return None
+    checked_rows = _checked_rows_from_table_image(img)
+    confirmations: List[str] = []
+    for row_tag in checked_rows:
+        code = row_codes.get(row_tag)
+        label = CONFIRMATION_CODE_MAP.get(code or "")
+        if label and label not in confirmations:
+            confirmations.append(label)
+    return confirmations
+
+
 def _normalize_instrument_text(value: Any) -> str:
     """Normalizza punteggiatura/spazi OCR per riconoscere in modo robusto gli strumenti."""
     s = str(value or "").lower()
@@ -657,21 +861,45 @@ def infer_instrument(top_text: str, full_text: str) -> Tuple[str, str]:
 
 
 def parse_signal(full_text: str, top_text: str) -> Dict[str, Any]:
+    # La fascia superiore ha priorità perché contiene la nuova tabella ed evita che
+    # le etichette ripetute sul grafico interferiscano con E1/E2/T1/T2/T3/Stop.
     combined = top_text + "\n" + full_text
-    direction_match = re.search(r"\b(LONG|SHORT)\b", combined, flags=re.I)
+    direction_match = re.search(r"\b(LONG|SHORT)\b", top_text, flags=re.I) or re.search(r"\b(LONG|SHORT)\b", combined, flags=re.I)
     instrument, ticker = infer_instrument(top_text, full_text)
+    table_meta = parse_table_metadata(top_text)
+    full_meta = parse_table_metadata(full_text)
+    if table_meta.get("setup_origin") == "—" and full_meta.get("setup_origin") != "—":
+        table_meta["setup_origin"] = full_meta.get("setup_origin")
+    if table_meta.get("setup_timeframe") == "—" and full_meta.get("setup_timeframe") != "—":
+        table_meta["setup_timeframe"] = full_meta.get("setup_timeframe")
+    if not table_meta.get("confirmations") and full_meta.get("confirmations"):
+        table_meta["confirmations"] = full_meta.get("confirmations")
+
+    shared_stop = extract_shared_stop_value(top_text) or extract_shared_stop_value(full_text)
+    s1_value = extract_tag_value(top_text, "S1")
+    s2_value = extract_tag_value(top_text, "S2")
+    if shared_stop is not None:
+        # Nel nuovo formato c'è un solo Stop comune ai due livelli di entry.
+        if s1_value is None:
+            s1_value = shared_stop
+        if s2_value is None:
+            s2_value = shared_stop
+
     parsed = {
-        "valid_date": parse_date(combined),
+        "valid_date": parse_date(top_text) or parse_date(combined),
         "instrument": instrument,
         "ticker": ticker,
         "direction": direction_match.group(1).upper() if direction_match else "",
-        "e1": extract_tag_value(combined, "E1"),
-        "s1": extract_tag_value(combined, "S1"),
-        "e2": extract_tag_value(combined, "E2"),
-        "s2": extract_tag_value(combined, "S2"),
-        "t1": extract_tag_value(combined, "T1"),
-        "t2": extract_tag_value(combined, "T2"),
-        "t3": extract_tag_value(combined, "T3"),
+        "e1": extract_tag_value(top_text, "E1") or extract_tag_value(combined, "E1"),
+        "s1": s1_value if s1_value is not None else extract_tag_value(combined, "S1"),
+        "e2": extract_tag_value(top_text, "E2") or extract_tag_value(combined, "E2"),
+        "s2": s2_value if s2_value is not None else extract_tag_value(combined, "S2"),
+        "t1": extract_tag_value(top_text, "T1") or extract_tag_value(combined, "T1"),
+        "t2": extract_tag_value(top_text, "T2") or extract_tag_value(combined, "T2"),
+        "t3": extract_tag_value(top_text, "T3") or extract_tag_value(combined, "T3"),
+        "setup_origin": table_meta.get("setup_origin", "—"),
+        "setup_timeframe": table_meta.get("setup_timeframe", "—"),
+        "confirmations": table_meta.get("confirmations", []),
     }
     for field in ("e1", "s1", "e2", "s2", "t1", "t2", "t3"):
         parsed[field] = normalize_level_for_instrument(instrument, parsed.get(field))
@@ -684,14 +912,24 @@ def parse_signal(full_text: str, top_text: str) -> Dict[str, Any]:
 
 def confirmations_list(value: Any) -> List[str]:
     if isinstance(value, list):
-        return [str(x) for x in value]
-    if isinstance(value, str) and value.strip():
+        parsed = [str(x) for x in value]
+    elif isinstance(value, str) and value.strip():
         try:
-            parsed = __import__("json").loads(value)
-            return [str(x) for x in parsed] if isinstance(parsed, list) else []
+            obj = __import__("json").loads(value)
+            parsed = [str(x) for x in obj] if isinstance(obj, list) else []
         except Exception:
-            return []
-    return []
+            parsed = []
+    else:
+        parsed = []
+
+    aliases = {"FIBO": "Fibonacci", "Fibo": "Fibonacci", "DIV.": "Divergenze"}
+    out: List[str] = []
+    for item in parsed:
+        name = aliases.get(item, item)
+        # Bollinger, Price Action e News sono stati rimossi dalla metodologia.
+        if name in CONFIRMATIONS and name not in out:
+            out.append(name)
+    return out
 
 
 def upload_screenshot(uploaded_file) -> str:
@@ -1763,6 +2001,11 @@ def page_new_signal() -> None:
             with st.spinner("Lettura OCR in corso..."):
                 full_text, top_text = run_ocr(img)
                 parsed = parse_signal(full_text, top_text)
+                # Nel nuovo template le X vengono lette direttamente dalla quarta colonna
+                # dell'immagine: è più affidabile dell'OCR della singola lettera X.
+                table_confirmations = extract_confirmations_from_table_image(img, full_text)
+                if table_confirmations is not None:
+                    parsed["confirmations"] = table_confirmations
                 chart_levels = extract_chart_levels_from_lines(img)
                 for field in ("e1", "s1", "e2", "s2", "t1", "t2", "t3"):
                     if parsed.get(field) is None and chart_levels.get(field) is not None:
@@ -1784,6 +2027,7 @@ def page_new_signal() -> None:
     ocr = st.session_state.get("ocr_data") or {
         "valid_date": None, "instrument": "", "ticker": "", "direction": "",
         "e1": None, "s1": None, "e2": None, "s2": None, "t1": None, "t2": None, "t3": None,
+        "setup_origin": "—", "setup_timeframe": "—", "confirmations": [],
         "full_text": "", "top_text": "", "chart_levels": {},
     }
 
@@ -1794,7 +2038,7 @@ def page_new_signal() -> None:
         help="Attivalo quando il segnale prevede un terzo target.",
     )
 
-    with st.form("signal_form"):
+    with st.form(f"signal_form_{file_hash[:12]}"):
         st.markdown("#### 1. Segnale originale")
         c1, c2, c3 = st.columns(3)
         default_date = date.fromisoformat(ocr["valid_date"]) if ocr.get("valid_date") else local_now().date()
@@ -1825,14 +2069,29 @@ def page_new_signal() -> None:
 
         st.markdown("#### 2. Contesto del setup — facoltativo")
         c1, c2, c3 = st.columns(3)
-        setup_origin = c1.selectbox("Origine del setup", SETUP_ORIGINS)
+        origin_default = str(ocr.get("setup_origin") or "—")
+        origin_index = SETUP_ORIGINS.index(origin_default) if origin_default in SETUP_ORIGINS else 0
+        setup_origin = c1.selectbox(
+            "Origine del setup", SETUP_ORIGINS, index=origin_index,
+            key=f"new_origin_{file_hash[:12]}",
+        )
         reference_area = c2.text_input("Livello / area Balance o svolta", placeholder="es. 4365–4398")
-        setup_tf = c3.selectbox("Timeframe del riferimento", TIMEFRAMES)
+        tf_default = str(ocr.get("setup_timeframe") or "—")
+        tf_index = TIMEFRAMES.index(tf_default) if tf_default in TIMEFRAMES else 0
+        setup_tf = c3.selectbox(
+            "Timeframe del riferimento", TIMEFRAMES, index=tf_index,
+            key=f"new_setup_tf_{file_hash[:12]}",
+        )
         st.markdown("**Conferme osservate — tutte facoltative**")
         cols = st.columns(4)
         confirmations: List[str] = []
+        ocr_confirmations = confirmations_list(ocr.get("confirmations"))
         for i, name in enumerate(CONFIRMATIONS):
-            if cols[i % 4].checkbox(name, key=f"new_conf_{i}"):
+            if cols[i % 4].checkbox(
+                name,
+                value=name in ocr_confirmations,
+                key=f"new_conf_{file_hash[:12]}_{i}",
+            ):
                 confirmations.append(name)
         notes = st.text_area("Note / motivazione del setup", placeholder="Scrivi solo se serve. Campo facoltativo.")
         distinct_signal = st.checkbox(
