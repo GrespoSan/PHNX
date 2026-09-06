@@ -20,7 +20,7 @@ import yfinance as yf
 from supabase import create_client, Client
 
 APP_NAME = "G. Signal Tracker"
-APP_VERSION = "V4.5"
+APP_VERSION = "V4.6"
 BUCKET_NAME = "signal-screenshots"
 LOCAL_TZ = ZoneInfo("Europe/Rome")
 
@@ -939,7 +939,10 @@ def _checked_rows_from_table_bbox(img: Image.Image, bbox: Tuple[int, int, int, i
     arr = np.array(img.convert("RGB"))
     x_left, y_top, x_right, y_bottom = bbox
     row_labels = ["HEADER", "E1", "E2", "T1", "T2", "T3", "STOP"]
-    x0 = int(x_left + (x_right - x_left) * 0.90)
+    # La colonna X è l'ultima e molto stretta. Prendiamo circa l'ultimo 13% del
+    # bbox reale della tabella: abbastanza largo per piccole variazioni di scala,
+    # ma senza invadere la colonna delle sigle conferma.
+    x0 = int(x_left + (x_right - x_left) * 0.87)
     x1 = max(x0 + 2, x_right - 2)
     checked: List[str] = []
     for r, label in enumerate(row_labels):
@@ -2180,6 +2183,29 @@ def final_screenshot_button(row: Dict[str, Any], key: str, use_container_width: 
 # Pagine
 # -----------------------------------------------------------------------------
 
+
+def _reset_new_signal_widget_state() -> None:
+    """Azzera i widget del form Nuovo segnale prima di applicare un nuovo risultato OCR.
+
+    Streamlit conserva i valori dei widget in session_state. Senza questo reset,
+    dopo un redeploy o una nuova lettura dello stesso screenshot possono restare
+    valori vecchi (per esempio E1 o checkbox conferme) anche se l'OCR nuovo è corretto.
+    """
+    prefixes = (
+        "new_date_", "new_instrument_", "new_direction_", "new_ticker_",
+        "new_e1_", "new_s1_", "new_e2_", "new_s2_",
+        "new_t1_", "new_t2_", "new_t3_",
+        "new_origin_", "new_reference_", "new_setup_tf_",
+        "new_conf_", "new_notes_", "new_distinct_",
+    )
+    for key in list(st.session_state.keys()):
+        if any(str(key).startswith(prefix) for prefix in prefixes):
+            try:
+                del st.session_state[key]
+            except Exception:
+                pass
+
+
 def page_new_signal() -> None:
     if not can_write():
         st.error("Il tuo profilo è in sola lettura.")
@@ -2233,14 +2259,16 @@ def page_new_signal() -> None:
                         parsed[field] = normalize_level_for_instrument(parsed.get("instrument"), chart_levels[field])
                     else:
                         parsed[field] = normalize_level_for_instrument(parsed.get("instrument"), parsed.get(field))
+                # Prima di mostrare i nuovi valori OCR eliminiamo gli eventuali valori
+                # vecchi dei widget. Questo evita casi in cui E1 o una conferma restano
+                # quelli della lettura precedente nonostante l'OCR attuale sia corretto.
+                _reset_new_signal_widget_state()
                 st.session_state["ocr_data"] = {
                     **parsed, "full_text": full_text, "top_text": top_text,
                     "chart_levels": chart_levels,
                     "table_data": table_data or {},
                 }
                 st.session_state["ocr_error"] = None
-                # Forza la ricreazione dei widget del form: altrimenti Streamlit conserva
-                # i vecchi valori (es. checkbox false) e non mostra le spunte lette dall'OCR.
                 st.session_state["ocr_generation"] = int(st.session_state.get("ocr_generation", 0)) + 1
         except Exception as e:
             st.session_state["ocr_error"] = str(e)
@@ -2257,7 +2285,7 @@ def page_new_signal() -> None:
     }
 
     form_generation = int(st.session_state.get("ocr_generation", 0))
-    form_suffix = f"{file_hash[:12]}_{form_generation}"
+    form_suffix = f"{APP_VERSION.replace('.', '_')}_{file_hash[:12]}_{form_generation}"
 
     with st.form(f"signal_form_{form_suffix}"):
         st.markdown("#### 1. Segnale originale")
@@ -2370,7 +2398,7 @@ def page_new_signal() -> None:
                 if t3 is not None:
                     payload["t3"] = t3
                 signal_id = insert_signal(payload)
-            st.success(f"Segnale #{signal_id} salvato in modo persistente.")
+            st.success(f"Segnale #{signal_id} salvato.")
             st.session_state["ocr_hash"] = None
             st.session_state["ocr_data"] = None
         except Exception as e:
