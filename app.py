@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import hashlib
+import hmac
 import re
 import shutil
 from datetime import datetime, date, timedelta
@@ -19,14 +20,13 @@ import yfinance as yf
 from supabase import create_client, Client
 
 APP_NAME = "G. Signal Tracker"
-APP_VERSION = "V4.0"
+APP_VERSION = "V4.1"
 BUCKET_NAME = "signal-screenshots"
 LOCAL_TZ = ZoneInfo("Europe/Rome")
 
 ROLE_LABELS = {
     "admin": "Amministratore",
     "collaborator": "Collaboratore",
-    "viewer": "Solo lettura",
 }
 WRITE_ROLES = {"admin", "collaborator"}
 
@@ -146,10 +146,11 @@ TRADINGVIEW_SYMBOL_BY_YAHOO = {
 
 
 # -----------------------------------------------------------------------------
-# Configurazione Supabase / autenticazione
+# Configurazione Supabase / accesso app con sola password
 # -----------------------------------------------------------------------------
 
 def get_secret(name: str, default: str = "") -> str:
+    """Legge un segreto dalla sezione [supabase]."""
     try:
         cfg = st.secrets.get("supabase", {})
         value = cfg.get(name, default)
@@ -158,18 +159,40 @@ def get_secret(name: str, default: str = "") -> str:
         return default
 
 
+def get_access_secret(name: str, default: str = "") -> str:
+    """Legge un segreto dalla sezione [access]."""
+    try:
+        cfg = st.secrets.get("access", {})
+        value = cfg.get(name, default)
+        return str(value) if value is not None else default
+    except Exception:
+        return default
+
+
 def supabase_config() -> Dict[str, str]:
     return {
         "url": get_secret("url"),
-        "anon_key": get_secret("anon_key") or get_secret("publishable_key"),
         "service_role_key": get_secret("service_role_key") or get_secret("secret_key"),
-        "admin_email": get_secret("admin_email").lower(),
+    }
+
+
+def access_config() -> Dict[str, str]:
+    return {
+        "admin_password": get_access_secret("admin_password"),
+        "collaborator_password": get_access_secret("collaborator_password"),
     }
 
 
 def config_ready() -> bool:
-    cfg = supabase_config()
-    return bool(cfg["url"] and cfg["anon_key"])
+    sb = supabase_config()
+    access = access_config()
+    return bool(
+        sb["url"]
+        and sb["service_role_key"]
+        and access["admin_password"]
+        and access["collaborator_password"]
+        and access["admin_password"] != access["collaborator_password"]
+    )
 
 
 def service_client() -> Optional[Client]:
@@ -180,18 +203,19 @@ def service_client() -> Optional[Client]:
 
 
 def user_client() -> Client:
-    client = st.session_state.get("sb_user_client")
+    """Client backend usato dall'app dopo lo sblocco con password.
+
+    La service role resta esclusivamente nei Secrets di Streamlit e non viene
+    mai mostrata al browser. I permessi dell'interfaccia continuano a dipendere
+    dal ruolo ricavato dalla password inserita.
+    """
+    client = st.session_state.get("sb_service_client")
     if client is None:
-        raise RuntimeError("Sessione Supabase non disponibile. Effettua nuovamente il login.")
+        client = service_client()
+        if client is None:
+            raise RuntimeError("Connessione Supabase non disponibile.")
+        st.session_state["sb_service_client"] = client
     return client
-
-
-def current_user_id() -> str:
-    return str(st.session_state.get("user_id", ""))
-
-
-def current_email() -> str:
-    return str(st.session_state.get("user_email", ""))
 
 
 def current_role() -> str:
@@ -207,90 +231,82 @@ def is_admin() -> bool:
 
 
 def clear_auth_state() -> None:
-    for key in ["sb_user_client", "user_id", "user_email", "user_role"]:
+    for key in ["app_unlocked", "user_role", "sb_service_client"]:
         st.session_state.pop(key, None)
 
 
-def fetch_own_role(client: Client, user_id: str) -> Optional[Dict[str, Any]]:
-    res = client.table("app_users").select("user_id,email,role,active").eq("user_id", user_id).limit(1).execute()
-    rows = res.data or []
-    return rows[0] if rows else None
+def audit_user_id() -> Optional[str]:
+    """Restituisce, se disponibile, un UUID esistente per i campi audit.
 
-
-def bootstrap_first_admin(user_id: str, email: str) -> Optional[Dict[str, Any]]:
-    cfg = supabase_config()
-    if not cfg["admin_email"] or email.lower() != cfg["admin_email"]:
-        return None
-    admin = service_client()
-    if admin is None:
-        return None
-    admin.table("app_users").upsert(
-        {"user_id": user_id, "email": email.lower(), "role": "admin", "active": True},
-        on_conflict="user_id",
-    ).execute()
-    return {"user_id": user_id, "email": email.lower(), "role": "admin", "active": True}
-
-
-def perform_login(email: str, password: str) -> Tuple[bool, str]:
-    cfg = supabase_config()
+    Mantiene compatibilità con le colonne created_by/updated_by già presenti
+    nel database senza richiedere l'autenticazione email/password di Supabase.
+    """
     try:
-        client = create_client(cfg["url"], cfg["anon_key"])
-        auth = client.auth.sign_in_with_password({"email": email.strip(), "password": password})
-        user = getattr(auth, "user", None)
-        if user is None:
-            return False, "Login non riuscito."
-        uid = str(getattr(user, "id", ""))
-        uemail = str(getattr(user, "email", email)).lower()
-        role_row = fetch_own_role(client, uid)
-        if role_row is None:
-            role_row = bootstrap_first_admin(uid, uemail)
-        if role_row is None or not bool(role_row.get("active", False)):
-            try:
-                client.auth.sign_out()
-            except Exception:
-                pass
-            return False, "Utente autenticato ma non autorizzato all'app. Chiedi all'amministratore di abilitarlo."
+        client = user_client()
+        role = current_role()
+        res = (
+            client.table("app_users")
+            .select("user_id")
+            .eq("role", role)
+            .eq("active", True)
+            .limit(1)
+            .execute()
+        )
+        rows = res.data or []
+        if rows and rows[0].get("user_id"):
+            return str(rows[0]["user_id"])
+        # fallback: usa un amministratore già presente, se disponibile
+        res = (
+            client.table("app_users")
+            .select("user_id")
+            .eq("role", "admin")
+            .eq("active", True)
+            .limit(1)
+            .execute()
+        )
+        rows = res.data or []
+        if rows and rows[0].get("user_id"):
+            return str(rows[0]["user_id"])
+    except Exception:
+        pass
+    return None
 
-        st.session_state["sb_user_client"] = client
-        st.session_state["user_id"] = uid
-        st.session_state["user_email"] = uemail
-        st.session_state["user_role"] = str(role_row.get("role", "viewer"))
-        return True, "Accesso eseguito."
-    except Exception as e:
-        return False, f"Accesso non riuscito: {e}"
+
+def perform_login(password: str) -> Tuple[bool, str]:
+    pwd = str(password or "")
+    access = access_config()
+    admin_pwd = access["admin_password"]
+    collaborator_pwd = access["collaborator_password"]
+
+    if admin_pwd and hmac.compare_digest(pwd, admin_pwd):
+        role = "admin"
+    elif collaborator_pwd and hmac.compare_digest(pwd, collaborator_pwd):
+        role = "collaborator"
+    else:
+        return False, "Password non corretta."
+
+    client = service_client()
+    if client is None:
+        return False, "Connessione Supabase non disponibile."
+
+    st.session_state["sb_service_client"] = client
+    st.session_state["user_role"] = role
+    st.session_state["app_unlocked"] = True
+    return True, "Accesso eseguito."
 
 
 def show_login() -> None:
     st.title(f"📊 {APP_NAME} {APP_VERSION}")
     st.caption("Archivio condiviso e persistente · accesso riservato")
     with st.form("login_form"):
-        email = st.text_input("Email")
         password = st.text_input("Password", type="password")
-        submitted = st.form_submit_button("🔐 Accedi", type="primary", use_container_width=True)
+        submitted = st.form_submit_button("🔓 Sblocca app", type="primary", use_container_width=True)
     if submitted:
-        ok, msg = perform_login(email, password)
+        ok, msg = perform_login(password)
         if ok:
-            st.success(msg)
             st.rerun()
         else:
             st.error(msg)
-
-
-def change_password_box() -> None:
-    with st.expander("🔑 Cambia password"):
-        p1 = st.text_input("Nuova password", type="password", key="new_pwd_1")
-        p2 = st.text_input("Ripeti nuova password", type="password", key="new_pwd_2")
-        if st.button("Aggiorna password", use_container_width=True):
-            if len(p1) < 8:
-                st.error("Usa una password di almeno 8 caratteri.")
-            elif p1 != p2:
-                st.error("Le password non coincidono.")
-            else:
-                try:
-                    user_client().auth.update_user({"password": p1})
-                    st.success("Password aggiornata.")
-                except Exception as e:
-                    st.error(f"Impossibile aggiornare la password: {e}")
 
 
 # -----------------------------------------------------------------------------
@@ -682,7 +698,7 @@ def upload_screenshot(uploaded_file) -> str:
     raw = uploaded_file.getvalue()
     digest = hashlib.sha1(raw).hexdigest()[:12]
     suffix = Path(uploaded_file.name).suffix.lower() or ".png"
-    user_folder = current_user_id() or "unknown"
+    user_folder = current_role() or "unknown"
     path = f"{user_folder}/{local_now():%Y%m%d_%H%M%S}_{digest}{suffix}"
     mime = uploaded_file.type or {
         ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp"
@@ -716,8 +732,10 @@ def download_screenshot(storage_path: str) -> Optional[bytes]:
 def insert_signal(data: Dict[str, Any]) -> int:
     payload = dict(data)
     payload["status"] = "PUBBLICATO"
-    payload["created_by"] = current_user_id()
-    payload["updated_by"] = current_user_id()
+    actor_id = audit_user_id()
+    if actor_id:
+        payload["created_by"] = actor_id
+        payload["updated_by"] = actor_id
     res = user_client().table("signals").insert(payload).execute()
     rows = res.data or []
     if not rows:
@@ -743,7 +761,9 @@ def load_signal(signal_id: int) -> Optional[Dict[str, Any]]:
 def update_signal(signal_id: int, **kwargs) -> None:
     if not kwargs:
         return
-    kwargs["updated_by"] = current_user_id()
+    actor_id = audit_user_id()
+    if actor_id:
+        kwargs["updated_by"] = actor_id
     kwargs["updated_at"] = now_iso()
     user_client().table("signals").update(kwargs).eq("id", int(signal_id)).execute()
 
@@ -2159,75 +2179,6 @@ def page_archive() -> None:
             edit_signal_panel(row, key_prefix="archive")
 
 
-def page_users() -> None:
-    if not is_admin():
-        st.error("Sezione riservata all'amministratore.")
-        return
-    admin = service_client()
-    if admin is None:
-        st.error("Manca service_role_key nei Secrets di Streamlit. Senza questa chiave non puoi gestire gli utenti dall'app.")
-        return
-
-    st.subheader("Gestione utenti")
-    st.caption("Crea colleghi autorizzati e assegna il livello di accesso. Le password temporanee vanno condivise in modo privato.")
-
-    with st.form("create_user_form"):
-        c1, c2 = st.columns(2)
-        email = c1.text_input("Email nuovo utente")
-        role = c2.selectbox("Ruolo", ["collaborator", "viewer"], format_func=lambda x: ROLE_LABELS[x])
-        temp_password = st.text_input("Password temporanea", type="password", help="Minimo 8 caratteri. L'utente potrà cambiarla dopo l'accesso.")
-        create = st.form_submit_button("➕ Crea utente", type="primary", use_container_width=True)
-    if create:
-        if "@" not in email or len(temp_password) < 8:
-            st.error("Inserisci un'email valida e una password temporanea di almeno 8 caratteri.")
-        else:
-            try:
-                resp = admin.auth.admin.create_user({
-                    "email": email.strip().lower(),
-                    "password": temp_password,
-                    "email_confirm": True,
-                })
-                new_user = getattr(resp, "user", None)
-                uid = str(getattr(new_user, "id", ""))
-                if not uid:
-                    raise RuntimeError("Supabase non ha restituito l'ID del nuovo utente.")
-                admin.table("app_users").upsert({
-                    "user_id": uid, "email": email.strip().lower(), "role": role, "active": True,
-                }, on_conflict="user_id").execute()
-                st.success(f"Utente {email.strip().lower()} creato come {ROLE_LABELS[role]}.")
-                st.rerun()
-            except Exception as e:
-                st.error(f"Creazione non riuscita: {e}")
-
-    res = admin.table("app_users").select("user_id,email,role,active,created_at").order("email").execute()
-    users = res.data or []
-    if users:
-        display = pd.DataFrame(users)
-        if "role" in display:
-            display["role"] = display["role"].map(lambda x: ROLE_LABELS.get(str(x), str(x)))
-        display = display.rename(columns={"email": "Email", "role": "Ruolo", "active": "Attivo", "created_at": "Creato"})
-        st.dataframe(display[[c for c in ["Email", "Ruolo", "Attivo", "Creato"] if c in display.columns]], use_container_width=True, hide_index=True)
-
-        st.markdown("#### Modifica autorizzazione")
-        user_map = {u["email"]: u for u in users}
-        selected_email = st.selectbox("Utente", list(user_map.keys()))
-        selected = user_map[selected_email]
-        role_options = ["admin", "collaborator", "viewer"]
-        idx = role_options.index(selected.get("role", "viewer")) if selected.get("role") in role_options else 2
-        c1, c2 = st.columns(2)
-        new_role = c1.selectbox("Ruolo", role_options, index=idx, format_func=lambda x: ROLE_LABELS[x], key="edit_role")
-        active = c2.checkbox("Utente attivo", value=bool(selected.get("active", True)), key="edit_active")
-        if st.button("💾 Salva autorizzazione", use_container_width=True):
-            if selected_email.lower() == current_email().lower() and (new_role != "admin" or not active):
-                st.error("Per sicurezza non puoi togliere a te stesso il ruolo amministratore o disattivarti da questa schermata.")
-            else:
-                try:
-                    admin.table("app_users").update({"role": new_role, "active": active, "updated_at": now_iso()}).eq("user_id", selected["user_id"]).execute()
-                    st.success("Autorizzazione aggiornata.")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Aggiornamento non riuscito: {e}")
-
 
 def page_info() -> None:
     st.subheader("Impostazione del metodo")
@@ -2251,15 +2202,19 @@ st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", page_icon="📊", lay
 
 if not config_ready():
     st.title(f"📊 {APP_NAME} {APP_VERSION}")
-    st.error("Supabase non è ancora configurato nei Secrets di Streamlit.")
+    st.error("Configurazione incompleta nei Secrets di Streamlit.")
     st.code(
-        '[supabase]\nurl = "https://TUO-PROGETTO.supabase.co"\nanon_key = "..."\nservice_role_key = "..."\nadmin_email = "tua@email.it"',
+        '[supabase]\nurl = "https://TUO-PROGETTO.supabase.co"\nservice_role_key = "sb_secret_..."\n\n'
+        '[access]\nadmin_password = "PASSWORD_AMMINISTRATORE"\ncollaborator_password = "PASSWORD_COLLABORATORE"',
         language="toml",
     )
-    st.caption("Non caricare mai service_role_key nel repository GitHub: va inserita solo nei Secrets dell'app Streamlit.")
+    st.caption(
+        "Le due password devono essere diverse. Non pubblicare mai service_role_key o le password nel repository GitHub: "
+        "devono restare esclusivamente nei Secrets di Streamlit."
+    )
     st.stop()
 
-if not st.session_state.get("sb_user_client"):
+if not st.session_state.get("app_unlocked"):
     show_login()
     st.stop()
 
@@ -2271,24 +2226,12 @@ role_label = ROLE_LABELS.get(role, role)
 
 with st.sidebar:
     st.markdown(f"### {APP_NAME}")
-    st.caption(f"👤 {current_email()}\n\n**{role_label}**")
+    st.caption(f"🔐 **{role_label}**")
 
-    pages = ["Dashboard"]
-    if can_write():
-        pages += ["Carica nuovo segnale"]
-    pages += ["Statistiche", "Archivio"]
-    if is_admin():
-        pages += ["Utenti"]
-    pages += ["Info"]
-
+    pages = ["Dashboard", "Carica nuovo segnale", "Statistiche", "Archivio", "Info"]
     page = st.radio("Sezione", pages)
     st.divider()
-    change_password_box()
     if st.button("🚪 Esci", use_container_width=True):
-        try:
-            user_client().auth.sign_out()
-        except Exception:
-            pass
         clear_auth_state()
         st.rerun()
 
@@ -2301,10 +2244,8 @@ try:
         page_stats()
     elif page == "Archivio":
         page_archive()
-    elif page == "Utenti":
-        page_users()
     else:
         page_info()
 except Exception as e:
     st.error(f"Errore applicazione: {e}")
-    st.caption("Se l'errore riguarda autorizzazioni o tabelle mancanti, verifica di aver eseguito SETUP_SUPABASE.sql nel progetto Supabase.")
+    st.caption("Se l'errore riguarda autorizzazioni o tabelle mancanti, verifica la configurazione Supabase del progetto.")
