@@ -20,7 +20,7 @@ import yfinance as yf
 from supabase import create_client, Client
 
 APP_NAME = "G. Signal Tracker"
-APP_VERSION = "V4.6"
+APP_VERSION = "V4.7"
 BUCKET_NAME = "signal-screenshots"
 LOCAL_TZ = ZoneInfo("Europe/Rome")
 
@@ -1228,6 +1228,10 @@ def update_signal(signal_id: int, **kwargs) -> None:
     user_client().table("signals").update(kwargs).eq("id", int(signal_id)).execute()
 
 
+def delete_signal(signal_id: int) -> None:
+    user_client().table("signals").delete().eq("id", int(signal_id)).execute()
+
+
 def _option_index(options: List[str], value: Any, default: int = 0) -> int:
     try:
         return options.index(str(value))
@@ -2206,6 +2210,45 @@ def _reset_new_signal_widget_state() -> None:
                 pass
 
 
+def extract_signal_payload_from_image(img: Image.Image) -> Dict[str, Any]:
+    """Esegue l'intera pipeline OCR sullo screenshot e restituisce i campi del segnale."""
+    full_text, top_text = run_ocr(img)
+    parsed = parse_signal(full_text, top_text)
+
+    # Nuovo motore dedicato alla tabella: la individua ovunque sia posizionata,
+    # legge righe/valori, X, RD e il box Timeframe adiacente.
+    table_data = extract_signal_table_data(img)
+    if table_data:
+        for field in ("valid_date", "direction", "e1", "e2", "t1", "t2", "t3"):
+            value = table_data.get(field)
+            if value not in (None, ""):
+                parsed[field] = value
+        shared_stop = table_data.get("shared_stop")
+        if shared_stop is not None:
+            parsed["s1"] = shared_stop
+            parsed["s2"] = shared_stop
+        if table_data.get("setup_origin") not in (None, "", "—"):
+            parsed["setup_origin"] = table_data["setup_origin"]
+        if table_data.get("setup_timeframe") not in (None, "", "—"):
+            parsed["setup_timeframe"] = table_data["setup_timeframe"]
+        parsed["confirmations"] = list(table_data.get("confirmations") or [])
+
+    chart_levels = extract_chart_levels_from_lines(img)
+    for field in ("e1", "s1", "e2", "s2", "t1", "t2", "t3"):
+        if parsed.get(field) is None and chart_levels.get(field) is not None:
+            parsed[field] = normalize_level_for_instrument(parsed.get("instrument"), chart_levels[field])
+        else:
+            parsed[field] = normalize_level_for_instrument(parsed.get("instrument"), parsed.get(field))
+
+    return {
+        **parsed,
+        "full_text": full_text,
+        "top_text": top_text,
+        "chart_levels": chart_levels,
+        "table_data": table_data or {},
+    }
+
+
 def page_new_signal() -> None:
     if not can_write():
         st.error("Il tuo profilo è in sola lettura.")
@@ -2232,42 +2275,12 @@ def page_new_signal() -> None:
     if st.button("🔎 Leggi screenshot", type="primary"):
         try:
             with st.spinner("Lettura OCR in corso..."):
-                full_text, top_text = run_ocr(img)
-                parsed = parse_signal(full_text, top_text)
-
-                # Nuovo motore dedicato alla tabella: la individua ovunque sia posizionata,
-                # legge righe/valori, X, RD e il box Timeframe adiacente.
-                table_data = extract_signal_table_data(img)
-                if table_data:
-                    for field in ("valid_date", "direction", "e1", "e2", "t1", "t2", "t3"):
-                        value = table_data.get(field)
-                        if value not in (None, ""):
-                            parsed[field] = value
-                    shared_stop = table_data.get("shared_stop")
-                    if shared_stop is not None:
-                        parsed["s1"] = shared_stop
-                        parsed["s2"] = shared_stop
-                    if table_data.get("setup_origin") not in (None, "", "—"):
-                        parsed["setup_origin"] = table_data["setup_origin"]
-                    if table_data.get("setup_timeframe") not in (None, "", "—"):
-                        parsed["setup_timeframe"] = table_data["setup_timeframe"]
-                    parsed["confirmations"] = list(table_data.get("confirmations") or [])
-
-                chart_levels = extract_chart_levels_from_lines(img)
-                for field in ("e1", "s1", "e2", "s2", "t1", "t2", "t3"):
-                    if parsed.get(field) is None and chart_levels.get(field) is not None:
-                        parsed[field] = normalize_level_for_instrument(parsed.get("instrument"), chart_levels[field])
-                    else:
-                        parsed[field] = normalize_level_for_instrument(parsed.get("instrument"), parsed.get(field))
+                ocr_payload = extract_signal_payload_from_image(img)
                 # Prima di mostrare i nuovi valori OCR eliminiamo gli eventuali valori
                 # vecchi dei widget. Questo evita casi in cui E1 o una conferma restano
                 # quelli della lettura precedente nonostante l'OCR attuale sia corretto.
                 _reset_new_signal_widget_state()
-                st.session_state["ocr_data"] = {
-                    **parsed, "full_text": full_text, "top_text": top_text,
-                    "chart_levels": chart_levels,
-                    "table_data": table_data or {},
-                }
+                st.session_state["ocr_data"] = ocr_payload
                 st.session_state["ocr_error"] = None
                 st.session_state["ocr_generation"] = int(st.session_state.get("ocr_generation", 0)) + 1
         except Exception as e:
@@ -2427,6 +2440,146 @@ def page_new_signal() -> None:
             st.code((ocr.get("top_text", "") + "\n---\n" + ocr.get("full_text", "")).strip())
 
 
+def _set_saved_signal_flash(key_prefix: str, message: str) -> None:
+    if str(key_prefix).startswith("dashboard_detail_"):
+        st.session_state["dashboard_flash_message"] = message
+        st.session_state["dashboard_table_version"] = int(st.session_state.get("dashboard_table_version", 0)) + 1
+    else:
+        st.session_state["edit_flash_message"] = message
+
+
+def reread_signal_from_storage(signal_id: int) -> str:
+    row = load_signal(int(signal_id))
+    if not row:
+        raise RuntimeError("Segnale non trovato.")
+
+    storage_path = _optional_path(row.get("screenshot_path"))
+    if not storage_path:
+        raise RuntimeError("Questo segnale non ha uno screenshot originale salvato.")
+    raw = download_screenshot(storage_path)
+    if not raw:
+        raise RuntimeError("Impossibile scaricare lo screenshot originale dallo Storage.")
+
+    img = Image.open(io.BytesIO(raw)).convert("RGB")
+    ocr = extract_signal_payload_from_image(img)
+
+    updates: Dict[str, Any] = {
+        "ocr_text": (ocr.get("top_text", "") + "\n" + ocr.get("full_text", "")).strip(),
+    }
+
+    # Aggiorna i campi del setup con priorità ai nuovi valori OCR, mantenendo i valori
+    # esistenti solo quando l'OCR non riesce davvero a leggerli.
+    if ocr.get("valid_date"):
+        updates["valid_date"] = ocr["valid_date"]
+    if str(ocr.get("instrument") or "").strip():
+        updates["instrument"] = canonical_instrument_label(ocr.get("instrument"))
+    if str(ocr.get("ticker") or "").strip():
+        updates["ticker"] = str(ocr.get("ticker") or "").strip()
+    if str(ocr.get("direction") or "").strip() in {"LONG", "SHORT"}:
+        updates["direction"] = str(ocr.get("direction")).strip()
+
+    for field in ("e1", "s1", "e2", "s2", "t1", "t2", "t3"):
+        value = ocr.get(field)
+        if value is not None:
+            updates[field] = value
+
+    if ocr.get("setup_origin") not in (None, "", "—"):
+        updates["setup_origin"] = ocr["setup_origin"]
+    if ocr.get("setup_timeframe") not in (None, "", "—"):
+        updates["setup_timeframe"] = ocr["setup_timeframe"]
+    confirmations = list(ocr.get("confirmations") or [])
+    if confirmations:
+        updates["confirmations"] = confirmations
+
+    existing_entry = _numeric_or_none(row.get("actual_entry"))
+    existing_stop = _numeric_or_none(row.get("actual_stop"))
+    has_real_trade = existing_entry is not None and existing_stop is not None
+    new_t1 = updates.get("t1", row.get("t1"))
+    new_t2 = updates.get("t2", row.get("t2"))
+    new_t3 = updates.get("t3", row.get("t3"))
+    new_direction = str(updates.get("direction", row.get("direction") or ""))
+    new_ticker = str(updates.get("ticker", row.get("ticker") or "")).strip()
+
+    monitoring_changed = False
+    if has_real_trade:
+        monitoring_changed = (
+            _num_changed(row.get("t1"), new_t1)
+            or _num_changed(row.get("t2"), new_t2)
+            or _num_changed(row.get("t3"), new_t3)
+            or str(row.get("direction") or "") != new_direction
+            or effective_yahoo_ticker(row).strip() != new_ticker.strip()
+        )
+
+    if monitoring_changed:
+        updates.update({
+            "status": "IN TRADE",
+            "outcome": None,
+            "t1_hit_time": None,
+            "t2_hit_time": None,
+            "stop_hit_time": None,
+            "result_note": "Screenshot riletto; monitoraggio da ricalcolare",
+            "last_check": None,
+        })
+        if new_t3 is not None or _numeric_or_none(row.get("t3")) is not None:
+            updates["t3_hit_time"] = None
+
+    update_signal(int(signal_id), **updates)
+    return (
+        "Screenshot riletto e dati aggiornati. Il monitoraggio verrà ricalcolato con i nuovi livelli."
+        if monitoring_changed else
+        "Screenshot riletto e dati aggiornati."
+    )
+
+
+def delete_signal_with_assets(signal_id: int) -> None:
+    row = load_signal(int(signal_id))
+    if not row:
+        raise RuntimeError("Segnale non trovato.")
+
+    for field in ("screenshot_path", "final_screenshot_path"):
+        path = _optional_path(row.get(field))
+        if path:
+            try:
+                remove_screenshot(path)
+            except Exception:
+                pass
+
+    delete_signal(int(signal_id))
+
+
+def render_saved_signal_actions(row: Dict[str, Any], key_prefix: str) -> None:
+    if not can_write():
+        return
+
+    sid = int(row["id"])
+    cols = st.columns(2 if is_admin() else 1)
+
+    with cols[0]:
+        if st.button("🔁 Rileggi screenshot", key=f"{key_prefix}_reread_{sid}", use_container_width=True):
+            try:
+                msg = reread_signal_from_storage(sid)
+                _set_saved_signal_flash(key_prefix, msg)
+                st.rerun()
+            except Exception as e:
+                st.error(f"Rilettura screenshot non riuscita: {e}")
+
+    if is_admin():
+        with cols[1]:
+            confirm_delete = st.checkbox("Confermo eliminazione", key=f"{key_prefix}_confirm_delete_{sid}")
+            if st.button(
+                "🗑️ Elimina segnale",
+                key=f"{key_prefix}_delete_{sid}",
+                use_container_width=True,
+                disabled=not confirm_delete,
+            ):
+                try:
+                    delete_signal_with_assets(sid)
+                    _set_saved_signal_flash(key_prefix, f"Segnale #{sid} eliminato.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Eliminazione non riuscita: {e}")
+
+
 def _optional_path(value: Any) -> str:
     if value is None:
         return ""
@@ -2495,6 +2648,7 @@ def dashboard_signal_detail(row: Dict[str, Any], quotes: Dict[str, float]) -> No
         st.link_button("📊 Apri TradingView", tv_url, use_container_width=False)
 
     if can_write():
+        render_saved_signal_actions(row, key_prefix=f"dashboard_detail_{sid}")
         _edit_signal_body(row, key_prefix=f"dashboard_detail_{sid}")
     else:
         st.caption("Profilo in sola lettura: i dati del segnale non sono modificabili.")
@@ -2732,6 +2886,7 @@ def page_archive() -> None:
                     f"Segnale #{sid} · {row['instrument']} · {row['direction']} · {row['valid_date']}",
                     key=f"open_img_archive_{sid}",
                 )
+            render_saved_signal_actions(row, key_prefix=f"archive_detail_{sid}")
             edit_signal_panel(row, key_prefix="archive")
 
 
