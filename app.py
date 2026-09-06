@@ -19,7 +19,7 @@ import yfinance as yf
 from supabase import create_client, Client
 
 APP_NAME = "G. Signal Tracker"
-APP_VERSION = "V3.9"
+APP_VERSION = "V4.0"
 BUCKET_NAME = "signal-screenshots"
 LOCAL_TZ = ZoneInfo("Europe/Rome")
 
@@ -108,6 +108,15 @@ INSTRUMENT_ALIASES = {
     "10y t-note": ("10Y T-NOTE FUTURES", "ZN=F"),
     "t-note": ("10Y T-NOTE FUTURES", "ZN=F"),
     "zn": ("10Y T-NOTE FUTURES", "ZN=F"),
+    "euro stoxx 50": ("EURO STOXX 50", "^STOXX50E"),
+    "euro stoxx": ("EURO STOXX 50", "^STOXX50E"),
+    "stoxx 50": ("EURO STOXX 50", "^STOXX50E"),
+    "stoxx50": ("EURO STOXX 50", "^STOXX50E"),
+    "fesx": ("EURO STOXX 50", "^STOXX50E"),
+    "dax 40": ("DAX", "^GDAXI"),
+    "dax index": ("DAX", "^GDAXI"),
+    "dax": ("DAX", "^GDAXI"),
+    "fdxm": ("DAX", "^GDAXI"),
 }
 
 TRADINGVIEW_SYMBOL_BY_YAHOO = {
@@ -131,6 +140,8 @@ TRADINGVIEW_SYMBOL_BY_YAHOO = {
     "ZB=F": "CBOT:ZB1!",
     "ZF=F": "CBOT:ZF1!",
     "ZT=F": "CBOT:ZT1!",
+    "^GDAXI": "EUREX:FDXM1!",
+    "^STOXX50E": "EUREX:FESX1!",
 }
 
 
@@ -598,6 +609,24 @@ def canonical_instrument_label(value: Any) -> str:
     return found[0] if found else str(value or "").strip()
 
 
+def normalize_level_for_instrument(instrument: Any, value: Any) -> Optional[float]:
+    """Corregge il punto usato come separatore delle migliaia sui grafici europei."""
+    v = _numeric_or_none(value)
+    if v is None:
+        return None
+    label = canonical_instrument_label(instrument).upper()
+    # Esempi TradingView in locale IT: 6.407 = 6407; 23.950 = 23950.
+    if label == "EURO STOXX 50" and 1.0 <= abs(v) < 20.0:
+        return v * 1000.0
+    if label == "DAX" and 10.0 <= abs(v) < 100.0:
+        return v * 1000.0
+    return v
+
+
+def signal_level_value(row: Dict[str, Any], field: str) -> Optional[float]:
+    return normalize_level_for_instrument(row.get("instrument"), row.get(field))
+
+
 def infer_instrument(top_text: str, full_text: str) -> Tuple[str, str]:
     combined = top_text + "\n" + full_text
     found = _known_instrument_from_text(combined)
@@ -615,7 +644,7 @@ def parse_signal(full_text: str, top_text: str) -> Dict[str, Any]:
     combined = top_text + "\n" + full_text
     direction_match = re.search(r"\b(LONG|SHORT)\b", combined, flags=re.I)
     instrument, ticker = infer_instrument(top_text, full_text)
-    return {
+    parsed = {
         "valid_date": parse_date(combined),
         "instrument": instrument,
         "ticker": ticker,
@@ -628,6 +657,9 @@ def parse_signal(full_text: str, top_text: str) -> Dict[str, Any]:
         "t2": extract_tag_value(combined, "T2"),
         "t3": extract_tag_value(combined, "T3"),
     }
+    for field in ("e1", "s1", "e2", "s2", "t1", "t2", "t3"):
+        parsed[field] = normalize_level_for_instrument(instrument, parsed.get(field))
+    return parsed
 
 
 # -----------------------------------------------------------------------------
@@ -765,10 +797,10 @@ def _edit_signal_body(row: Dict[str, Any], key_prefix: str) -> None:
         "Da qui puoi anche registrare Entry e Stop reali quando il setup diventa operativo."
     )
     use_t3_edit = st.checkbox(
-        "Usa T3 (raro)",
+        "Usa T3",
         value=_numeric_or_none(row.get("t3")) is not None,
         key=f"{key_prefix}_use_t3_{sid}",
-        help="Attivalo solo quando questo segnale prevede realmente un terzo target.",
+        help="Attivalo quando questo segnale prevede un terzo target.",
     )
 
     with st.form(f"{key_prefix}_edit_signal_{sid}"):
@@ -786,23 +818,23 @@ def _edit_signal_body(row: Dict[str, Any], key_prefix: str) -> None:
             key=f"{key_prefix}_dir_{sid}",
         )
         ticker_edit = st.text_input(
-            "Ticker Yahoo Finance", value=str(row.get("ticker") or ""), key=f"{key_prefix}_ticker_{sid}"
+            "Ticker Yahoo Finance", value=effective_yahoo_ticker(row), key=f"{key_prefix}_ticker_{sid}"
         )
 
         a1, a2, a3, a4 = st.columns(4)
-        e1_edit = normalize_number(a1.text_input("E1 indicativa", fmt_num(row.get("e1")), key=f"{key_prefix}_e1_{sid}"))
-        s1_edit = normalize_number(a2.text_input("S1 indicativo", fmt_num(row.get("s1")), key=f"{key_prefix}_s1_{sid}"))
-        e2_edit = normalize_number(a3.text_input("E2 indicativa", fmt_num(row.get("e2")), key=f"{key_prefix}_e2_{sid}"))
-        s2_edit = normalize_number(a4.text_input("S2 indicativo", fmt_num(row.get("s2")), key=f"{key_prefix}_s2_{sid}"))
+        e1_edit = normalize_number(a1.text_input("E1 indicativa", fmt_num(signal_level_value(row, "e1")), key=f"{key_prefix}_e1_{sid}"))
+        s1_edit = normalize_number(a2.text_input("S1 indicativo", fmt_num(signal_level_value(row, "s1")), key=f"{key_prefix}_s1_{sid}"))
+        e2_edit = normalize_number(a3.text_input("E2 indicativa", fmt_num(signal_level_value(row, "e2")), key=f"{key_prefix}_e2_{sid}"))
+        s2_edit = normalize_number(a4.text_input("S2 indicativo", fmt_num(signal_level_value(row, "s2")), key=f"{key_prefix}_s2_{sid}"))
         if use_t3_edit:
             b1, b2, b3 = st.columns(3)
-            t1_edit = normalize_number(b1.text_input("T1", fmt_num(row.get("t1")), key=f"{key_prefix}_t1_{sid}"))
-            t2_edit = normalize_number(b2.text_input("T2", fmt_num(row.get("t2")), key=f"{key_prefix}_t2_{sid}"))
-            t3_edit = normalize_number(b3.text_input("T3", fmt_num(row.get("t3")), key=f"{key_prefix}_t3_{sid}"))
+            t1_edit = normalize_number(b1.text_input("T1", fmt_num(signal_level_value(row, "t1")), key=f"{key_prefix}_t1_{sid}"))
+            t2_edit = normalize_number(b2.text_input("T2", fmt_num(signal_level_value(row, "t2")), key=f"{key_prefix}_t2_{sid}"))
+            t3_edit = normalize_number(b3.text_input("T3", fmt_num(signal_level_value(row, "t3")), key=f"{key_prefix}_t3_{sid}"))
         else:
             b1, b2 = st.columns(2)
-            t1_edit = normalize_number(b1.text_input("T1", fmt_num(row.get("t1")), key=f"{key_prefix}_t1_{sid}"))
-            t2_edit = normalize_number(b2.text_input("T2", fmt_num(row.get("t2")), key=f"{key_prefix}_t2_{sid}"))
+            t1_edit = normalize_number(b1.text_input("T1", fmt_num(signal_level_value(row, "t1")), key=f"{key_prefix}_t1_{sid}"))
+            t2_edit = normalize_number(b2.text_input("T2", fmt_num(signal_level_value(row, "t2")), key=f"{key_prefix}_t2_{sid}"))
             t3_edit = None
 
         st.markdown("#### Contesto del setup")
@@ -975,11 +1007,13 @@ def edit_signal_dialog(signal_id: int) -> None:
 # -----------------------------------------------------------------------------
 
 def effective_yahoo_ticker(row: Dict[str, Any]) -> str:
-    """Usa il ticker salvato; se manca prova a ricavarlo dal nome strumento."""
+    """Ticker Yahoo effettivo, con correzione dei principali indici europei."""
+    found = _known_instrument_from_text(row.get("instrument"))
+    if found and found[0] in {"DAX", "EURO STOXX 50"}:
+        return found[1]
     stored = str(row.get("ticker") or "").strip()
     if stored:
         return stored
-    found = _known_instrument_from_text(row.get("instrument"))
     return found[1] if found else ""
 
 
@@ -1119,13 +1153,13 @@ def active_target_distance(row: Dict[str, Any], current_price: Optional[float]) 
 
     if status == "T2 RAGGIUNTO":
         label = "T3"
-        target = row.get("t3")
+        target = signal_level_value(row, "t3")
     elif status == "T1 RAGGIUNTO":
         label = "T2"
-        target = row.get("t2")
+        target = signal_level_value(row, "t2")
     else:
         label = "T1"
-        target = row.get("t1")
+        target = signal_level_value(row, "t1")
 
     target_value = _numeric_or_none(target)
     if target_value is None:
@@ -1161,14 +1195,15 @@ def open_trade_status_label(row: Dict[str, Any]) -> str:
 
 
 def evaluate_trade(row: Dict[str, Any]) -> Dict[str, Optional[str]]:
-    if not row.get("ticker") or not row.get("entry_time") or row.get("actual_entry") is None or row.get("actual_stop") is None:
+    ticker = effective_yahoo_ticker(row)
+    if not ticker or not row.get("entry_time") or row.get("actual_entry") is None or row.get("actual_stop") is None:
         return {"status": row.get("status"), "outcome": row.get("outcome"), "note": "Dati trade incompleti"}
     try:
         start_dt = datetime.fromisoformat(str(row["entry_time"]).replace("Z", "+00:00"))
     except Exception:
         return {"status": row.get("status"), "outcome": row.get("outcome"), "note": "Ora ingresso non valida"}
 
-    df, interval = fetch_intraday(str(row["ticker"]), start_dt)
+    df, interval = fetch_intraday(ticker, start_dt)
     if df.empty:
         return {"status": row.get("status"), "outcome": row.get("outcome"), "note": "Dati prezzo non disponibili"}
 
@@ -1178,15 +1213,15 @@ def evaluate_trade(row: Dict[str, Any]) -> Dict[str, Optional[str]]:
         if not closes.empty:
             market_ts = closes.index[-1]
             source = f"Yahoo Finance · ultimo dato {market_ts}"
-            _store_market_quote(str(row["ticker"]), float(closes.iloc[-1]), local_now(), source)
+            _store_market_quote(ticker, float(closes.iloc[-1]), local_now(), source)
     except Exception:
         pass
 
     direction = str(row["direction"]).upper()
     stop = float(row["actual_stop"])
-    t1 = _numeric_or_none(row.get("t1"))
-    t2 = _numeric_or_none(row.get("t2"))
-    t3 = _numeric_or_none(row.get("t3"))
+    t1 = signal_level_value(row, "t1")
+    t2 = signal_level_value(row, "t2")
+    t3 = signal_level_value(row, "t3")
     t1_time = row.get("t1_hit_time")
     t2_time = row.get("t2_hit_time")
     t3_time = row.get("t3_hit_time")
@@ -1345,7 +1380,13 @@ def dataframe_for_display(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     if "instrument" in out.columns:
         out["instrument"] = out["instrument"].map(canonical_instrument_label)
-    for c in ["e1", "s1", "e2", "s2", "t1", "t2", "t3", "actual_entry", "actual_stop"]:
+    for c in ["e1", "s1", "e2", "s2", "t1", "t2", "t3"]:
+        if c in out.columns:
+            out[c] = df.apply(
+                lambda r: "—" if signal_level_value(r.to_dict(), c) is None else fmt_num(signal_level_value(r.to_dict(), c)),
+                axis=1,
+            )
+    for c in ["actual_entry", "actual_stop"]:
         if c in out.columns:
             out[c] = out[c].map(lambda x: "—" if pd.isna(x) else fmt_num(x))
     if "confirmations" in out.columns:
@@ -1447,6 +1488,9 @@ def styled_signals_dataframe(df: pd.DataFrame, quotes: Optional[Dict[str, float]
         def set_style(col: str, css: str) -> None:
             if col in row.index:
                 styles[row.index.get_loc(col)] = css
+
+        # L'ID è il punto di apertura del dettaglio: lo rendiamo visivamente riconoscibile.
+        set_style("ID", "color: #4da3ff; font-weight: 700;")
 
         status = str(raw.get("status") or "")
         outcome = str(raw.get("outcome") or "")
@@ -1664,7 +1708,9 @@ def page_new_signal() -> None:
                 chart_levels = extract_chart_levels_from_lines(img)
                 for field in ("e1", "s1", "e2", "s2", "t1", "t2", "t3"):
                     if parsed.get(field) is None and chart_levels.get(field) is not None:
-                        parsed[field] = chart_levels[field]
+                        parsed[field] = normalize_level_for_instrument(parsed.get("instrument"), chart_levels[field])
+                    else:
+                        parsed[field] = normalize_level_for_instrument(parsed.get("instrument"), parsed.get(field))
                 st.session_state["ocr_data"] = {
                     **parsed, "full_text": full_text, "top_text": top_text,
                     "chart_levels": chart_levels,
@@ -1684,10 +1730,10 @@ def page_new_signal() -> None:
     }
 
     use_t3 = st.checkbox(
-        "Usa T3 (raro)",
+        "Usa T3",
         value=_numeric_or_none(ocr.get("t3")) is not None,
         key=f"new_use_t3_{file_hash}",
-        help="Lascia disattivato normalmente. Attivalo solo quando il segnale prevede davvero un terzo target.",
+        help="Attivalo quando il segnale prevede un terzo target.",
     )
 
     with st.form("signal_form"):
@@ -1810,6 +1856,80 @@ def page_new_signal() -> None:
             st.code((ocr.get("top_text", "") + "\n---\n" + ocr.get("full_text", "")).strip())
 
 
+def _optional_path(value: Any) -> str:
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except Exception:
+        pass
+    s = str(value).strip()
+    return "" if s.lower() in {"", "none", "nan", "nat"} else s
+
+
+def dashboard_signal_detail(row: Dict[str, Any], quotes: Dict[str, float]) -> None:
+    """Apre sotto la tabella il dettaglio completo quando si clicca la cella ID."""
+    sid = int(row["id"])
+    instrument = canonical_instrument_label(row.get("instrument"))
+    direction = str(row.get("direction") or "")
+    valid_date = str(row.get("valid_date") or "")
+
+    st.divider()
+    st.markdown(f"## #{sid} · {instrument} · {direction}")
+    if valid_date:
+        st.caption(f"Data segnale: {valid_date}")
+
+    original_path = _optional_path(row.get("screenshot_path"))
+    final_path = _optional_path(row.get("final_screenshot_path"))
+    original_raw = download_screenshot(original_path) if original_path else None
+    final_raw = download_screenshot(final_path) if final_path else None
+
+    if original_raw and final_raw:
+        img1, img2 = st.columns(2)
+        with img1:
+            st.markdown("#### Screenshot originale")
+            st.image(original_raw, use_container_width=True)
+        with img2:
+            st.markdown("#### Screenshot finale")
+            st.image(final_raw, use_container_width=True)
+    elif original_raw:
+        st.markdown("#### Screenshot originale")
+        st.image(original_raw, use_container_width=True)
+    elif original_path:
+        st.warning("Lo screenshot originale risulta salvato, ma non è disponibile nello Storage.")
+
+    if trade_is_concluded(row) and (can_write() or final_path):
+        final_screenshot_button(row, key=f"dashboard_detail_final_{sid}", use_container_width=False)
+
+    ticker = effective_yahoo_ticker(row)
+    price = quotes.get(ticker) if ticker else None
+    state = open_trade_status_label(row)
+    if state == "PUBBLICATO":
+        state = operational_status_label(state)
+    outcome = row.get("outcome")
+    try:
+        if pd.isna(outcome):
+            outcome = None
+    except Exception:
+        pass
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Prezzo attuale", f"{float(price):.1f}" if price is not None else "—")
+    m2.metric("Stato", state or "—")
+    m3.metric("Esito", str(outcome) if outcome else "—")
+
+    tv_url = tradingview_chart_url(row)
+    if tv_url:
+        st.link_button("📊 Apri TradingView", tv_url, use_container_width=False)
+
+    if can_write():
+        st.markdown("### Modifica segnale")
+        _edit_signal_body(row, key_prefix=f"dashboard_detail_{sid}")
+    else:
+        st.caption("Profilo in sola lettura: i dati del segnale non sono modificabili.")
+
+
 @st.fragment(run_every="60s")
 def dashboard_live_panel(auto_monitor: bool) -> None:
     # Il frammento si aggiorna ogni 60 secondi solo mentre la Dashboard è aperta.
@@ -1862,76 +1982,41 @@ def dashboard_live_panel(auto_monitor: bool) -> None:
         hide_index=True,
         key="dashboard_signals_table",
         on_select="rerun",
-        selection_mode="single-row",
+        selection_mode="single-cell",
         column_config={
+            "ID": st.column_config.NumberColumn(
+                "ID",
+                help="Clicca sull'ID per aprire il dettaglio completo sotto la tabella",
+                width="small",
+            ),
             "TradingView": st.column_config.LinkColumn(
                 "TV",
                 help="Apri direttamente il grafico dello strumento su TradingView",
                 display_text="📊 Apri",
                 width="small",
-            )
+            ),
         },
     )
-    st.markdown(
-        "<div style='font-weight:800; color:#ffb347; text-transform:uppercase; margin-top:0.20rem; margin-bottom:0.15rem;'>"
-        "⬆️ SELEZIONA IL RIQUADRO ☐ A SINISTRA DELLA RIGA PER MOSTRARE I COMANDI MODIFICA E APRI GRAFICO SCREENSHOT ORIGINALE."
-        "</div>",
-        unsafe_allow_html=True,
-    )
-    st.caption("E1/E2 = livelli indicativi. Il Win Rate operativo usa Entry e Stop reali.")
 
-    selected_rows = []
+    selected_cells = []
     try:
-        selected_rows = list(table_event.selection.rows)
+        selected_cells = list(table_event.selection.cells)
     except Exception:
         try:
-            selected_rows = list(table_event.get("selection", {}).get("rows", []))
+            selected_cells = list(table_event.get("selection", {}).get("cells", []))
         except Exception:
-            selected_rows = []
+            selected_cells = []
 
-    if selected_rows:
-        pos = int(selected_rows[0])
-        if 0 <= pos < len(df):
+    if selected_cells:
+        try:
+            pos, column_name = selected_cells[0]
+            pos = int(pos)
+        except Exception:
+            pos, column_name = -1, ""
+        if column_name == "ID" and 0 <= pos < len(df):
             selected_raw = df.iloc[pos].to_dict()
-            sid = int(selected_raw["id"])
-            st.caption(
-                f"Segnale selezionato: #{sid} · {selected_raw.get('instrument','')} · "
-                f"{selected_raw.get('direction','')} · {selected_raw.get('valid_date','')}"
-            )
-            concluded = trade_is_concluded(selected_raw)
-            if can_write():
-                cols = st.columns(3 if concluded else 2)
-                if cols[0].button("✏️ Modifica", key=f"dashboard_edit_{sid}", use_container_width=True):
-                    edit_signal_dialog(sid)
-                if cols[1].button(
-                    "🖼️ Apri grafico Screenshot originale", key=f"dashboard_image_{sid}",
-                    use_container_width=True, disabled=not bool(selected_raw.get("screenshot_path")),
-                ):
-                    open_signal_image_dialog(
-                        selected_raw.get("screenshot_path") or "",
-                        f"Segnale #{sid} · {selected_raw.get('instrument','')} · {selected_raw.get('direction','')} · {selected_raw.get('valid_date','')}",
-                    )
-                if concluded:
-                    has_final = bool(selected_raw.get("final_screenshot_path"))
-                    final_label = "📸 Apri screenshot finale" if has_final else "📸 Carica screenshot finale"
-                    if cols[2].button(final_label, key=f"dashboard_final_{sid}", use_container_width=True):
-                        final_screenshot_dialog(sid)
-            else:
-                cols = st.columns(2 if concluded and selected_raw.get("final_screenshot_path") else 1)
-                if cols[0].button(
-                    "🖼️ Apri grafico Screenshot originale", key=f"dashboard_image_view_{sid}",
-                    use_container_width=True, disabled=not bool(selected_raw.get("screenshot_path")),
-                ):
-                    open_signal_image_dialog(
-                        selected_raw.get("screenshot_path") or "",
-                        f"Segnale #{sid} · {selected_raw.get('instrument','')} · {selected_raw.get('direction','')} · {selected_raw.get('valid_date','')}",
-                    )
-                if concluded and selected_raw.get("final_screenshot_path"):
-                    if cols[1].button("📸 Apri screenshot finale", key=f"dashboard_final_view_{sid}", use_container_width=True):
-                        final_screenshot_dialog(sid)
+            dashboard_signal_detail(selected_raw, quotes)
 
-            # Il grafico TradingView è apribile direttamente dalla colonna TV della tabella,
-            # senza dover selezionare la riga o entrare in modifica.
     st.download_button(
         "⬇️ Esporta storico Excel", data=excel_bytes(df),
         file_name=f"signal_tracker_{local_now().date().isoformat()}.xlsx",
