@@ -20,7 +20,7 @@ import yfinance as yf
 from supabase import create_client, Client
 
 APP_NAME = "G. Signal Tracker"
-APP_VERSION = "V4.1"
+APP_VERSION = "V4.2"
 BUCKET_NAME = "signal-screenshots"
 LOCAL_TZ = ZoneInfo("Europe/Rome")
 
@@ -979,11 +979,19 @@ def _edit_signal_body(row: Dict[str, Any], key_prefix: str) -> None:
         try:
             update_signal(sid, **updates)
             if trade_started_now:
-                st.success("Ingresso reale registrato. Il trade è ora IN TRADE e verrà monitorato automaticamente.")
+                success_message = "Ingresso reale registrato. Il trade è ora IN TRADE e verrà monitorato automaticamente."
             elif monitoring_changed:
-                st.success("Modifiche salvate. Il monitoraggio è stato azzerato e verrà ricalcolato con i nuovi dati.")
+                success_message = "Modifiche salvate. Il monitoraggio è stato azzerato e verrà ricalcolato con i nuovi dati."
             else:
-                st.success("Modifiche salvate.")
+                success_message = "Modifiche salvate."
+
+            # Se la modifica arriva dal dettaglio aperto sotto la Dashboard,
+            # dopo il salvataggio chiudiamo il dettaglio e torniamo alla sola Dashboard.
+            if str(key_prefix).startswith("dashboard_detail_"):
+                st.session_state["dashboard_flash_message"] = success_message
+                st.session_state["dashboard_table_version"] = int(st.session_state.get("dashboard_table_version", 0)) + 1
+            else:
+                st.session_state["edit_flash_message"] = success_message
             st.rerun()
         except Exception as e:
             msg = str(e)
@@ -2000,7 +2008,7 @@ def dashboard_live_panel(auto_monitor: bool) -> None:
         styled_signals_dataframe(df, quotes),
         use_container_width=True,
         hide_index=True,
-        key="dashboard_signals_table",
+        key=f"dashboard_signals_table_{int(st.session_state.get('dashboard_table_version', 0))}",
         on_select="rerun",
         selection_mode="single-cell",
         column_config={
@@ -2047,6 +2055,9 @@ def dashboard_live_panel(auto_monitor: bool) -> None:
 
 def page_dashboard() -> None:
     st.subheader("Dashboard")
+    flash_message = st.session_state.pop("dashboard_flash_message", None)
+    if flash_message:
+        st.success(flash_message)
     if can_write():
         auto_monitor = st.toggle(
             "Monitoraggio automatico trade aperti (ogni 60 secondi)",
@@ -2133,6 +2144,9 @@ def page_stats() -> None:
 
 def page_archive() -> None:
     st.subheader("Archivio segnali")
+    flash_message = st.session_state.pop("edit_flash_message", None)
+    if flash_message:
+        st.success(flash_message)
     df = load_signals()
     if df.empty:
         st.info("Archivio vuoto.")
