@@ -19,7 +19,7 @@ import yfinance as yf
 from supabase import create_client, Client
 
 APP_NAME = "G. Signal Tracker"
-APP_VERSION = "V3.6"
+APP_VERSION = "V3.8"
 BUCKET_NAME = "signal-screenshots"
 LOCAL_TZ = ZoneInfo("Europe/Rome")
 
@@ -330,6 +330,187 @@ def run_ocr(img: Image.Image) -> Tuple[str, str]:
     return full_text, top_text
 
 
+def _numeric_or_none(value: Any) -> Optional[float]:
+    """Converte un valore numerico opzionale; None/NaN/NaT restano assenti."""
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+    try:
+        v = float(value)
+        return v if np.isfinite(v) else None
+    except Exception:
+        return None
+
+
+def _max_true_run(mask: np.ndarray) -> int:
+    if mask.size == 0:
+        return 0
+    arr = mask.astype(np.int8)
+    diff = np.diff(np.concatenate(([0], arr, [0])))
+    starts = np.where(diff == 1)[0]
+    ends = np.where(diff == -1)[0]
+    if starts.size == 0:
+        return 0
+    return int(np.max(ends - starts))
+
+
+def _candidate_horizontal_lines(img: Image.Image) -> List[int]:
+    """Trova lunghe linee orizzontali nel grafico senza dipendenze aggiuntive."""
+    gray = np.array(ImageOps.grayscale(img))
+    h, w = gray.shape
+    x0, x1 = int(w * 0.20), int(w * 0.94)
+    min_run = max(120, int(w * 0.14))
+    candidates: List[Tuple[int, int]] = []
+    for y in range(max(20, int(h * 0.10)), min(h - 20, int(h * 0.88))):
+        run = _max_true_run(gray[y, x0:x1] < 155)
+        if run >= min_run:
+            candidates.append((y, run))
+    groups: List[List[Tuple[int, int]]] = []
+    for y, run in candidates:
+        if not groups or y - groups[-1][-1][0] > 3:
+            groups.append([])
+        groups[-1].append((y, run))
+    return [max(group, key=lambda item: item[1])[0] for group in groups]
+
+
+def _normalize_chart_tag(token: str) -> Optional[str]:
+    s = str(token or "").upper().strip()
+    s = s.replace("$", "S").replace("£", "E")
+    s = re.sub(r"[^A-Z0-9]", "", s)
+    aliases = {"TL": "T1", "TI": "T1", "SI": "S1", "EI": "E1"}
+    s = aliases.get(s, s)
+    return s if re.fullmatch(r"[EST][123]", s) else None
+
+
+def _ocr_chart_tag_positions(img: Image.Image) -> Dict[str, float]:
+    """Legge E/S/T direttamente dalle etichette stampate sulle linee."""
+    w, h = img.size
+    found: Dict[str, Tuple[float, float]] = {}
+    # Ritaglio concentrato sulla zona in cui normalmente sono scritte E/S/T.
+    crops = [(0.50, 0.85, 0.12, 0.75), (0.48, 0.88, 0.20, 0.70)]
+    for crop_no, (xf0, xf1, yf0, yf1) in enumerate(crops):
+        x0, x1 = int(w * xf0), int(w * xf1)
+        y0, y1 = int(h * yf0), int(h * yf1)
+        crop = ImageOps.grayscale(img.crop((x0, y0, x1, y1)))
+        scale = 4
+        crop = crop.resize((crop.width * scale, crop.height * scale))
+        crop = ImageEnhance.Contrast(crop).enhance(3.0)
+        try:
+            data = pytesseract.image_to_data(crop, config="--psm 11", output_type=pytesseract.Output.DICT)
+        except Exception:
+            continue
+        n = len(data.get("text", []))
+        for i in range(n):
+            tag = _normalize_chart_tag(data["text"][i])
+            if not tag:
+                continue
+            try:
+                conf = float(data.get("conf", [0] * n)[i])
+            except Exception:
+                conf = 0.0
+            if conf < 20:
+                continue
+            top = float(data["top"][i])
+            height = float(data["height"][i])
+            yy = y0 + (top + height / 2.0) / scale
+            if tag not in found or conf > found[tag][1]:
+                found[tag] = (yy, conf)
+        # Se il primo ritaglio ha già trovato almeno due riferimenti utili,
+        # evitiamo una seconda chiamata OCR costosa.
+        if crop_no == 0 and len(found) >= 2:
+            break
+    return {tag: yy for tag, (yy, _) in found.items()}
+
+def _ocr_dark_price_near_y(img: Image.Image, y: int) -> Optional[float]:
+    """Legge il cartellino prezzo scuro a destra, anche se è leggermente spostato."""
+    w, h = img.size
+    x0, x1 = int(w * 0.95), int(w * 0.997)
+    scored: List[Tuple[float, int]] = []
+    for off in range(-24, 25, 2):
+        yy = max(12, min(h - 13, int(y + off)))
+        small = np.array(ImageOps.grayscale(img.crop((x0, yy - 10, x1, yy + 11))))
+        scored.append((float(np.mean(small < 85)), yy))
+
+    # Proviamo solo i tre centri più plausibili per non rallentare l'OCR.
+    centers: List[Tuple[float, int]] = []
+    for score, yy in sorted(scored, reverse=True):
+        if score < 0.08:
+            continue
+        if any(abs(yy - prev_y) < 5 for _, prev_y in centers):
+            continue
+        centers.append((score, yy))
+        if len(centers) == 3:
+            break
+
+    integer_fallback: Optional[float] = None
+    for _, yy in centers:
+        crop = ImageOps.grayscale(img.crop((x0, yy - 12, x1, yy + 13)))
+        crop = crop.resize((crop.width * 8, crop.height * 8))
+        arr = np.array(crop)
+        for threshold in (100, 130):
+            bw = Image.fromarray(np.where(arr < threshold, 0, 255).astype("uint8"))
+            try:
+                raw = pytesseract.image_to_string(
+                    bw, config="--psm 7 -c tessedit_char_whitelist=0123456789.,"
+                ).strip()
+            except Exception:
+                continue
+            m = re.search(r"\d+(?:[.,]\d+)?", raw)
+            if not m:
+                continue
+            token = m.group(0)
+            value = normalize_number(token)
+            if value is None:
+                continue
+            # Se è presente il separatore decimale è quasi sempre la lettura più
+            # affidabile dei cartellini TradingView (es. 6.520, 107.8125).
+            if "." in token or "," in token:
+                return value
+            if integer_fallback is None:
+                integer_fallback = value
+    return integer_fallback
+
+def extract_chart_levels_from_lines(img: Image.Image) -> Dict[str, float]:
+    """
+    OCR posizionale: associa E1/E2/S1/S2/T1/T2/T3 alle linee orizzontali
+    e ai cartellini prezzo sulla scala destra. È un fallback e i campi restano
+    sempre correggibili manualmente.
+    """
+    lines = _candidate_horizontal_lines(img)
+    if not lines:
+        return {}
+    tag_positions = _ocr_chart_tag_positions(img)
+    assigned_y: Dict[str, int] = {}
+    for tag, yy in tag_positions.items():
+        nearest = min(lines, key=lambda ly: abs(ly - yy))
+        if abs(nearest - yy) <= 32:
+            assigned_y[tag] = nearest
+
+    # Caso frequente: E1/T1 sono attraversati dalla linea e Tesseract vede E2/T2.
+    # Tra E2 e T2 la sequenza geometrica è E1 -> T1 sia LONG sia SHORT.
+    if "E2" in assigned_y and "T2" in assigned_y:
+        y_e2, y_t2 = assigned_y["E2"], assigned_y["T2"]
+        lo, hi = sorted((y_e2, y_t2))
+        occupied = set(assigned_y.values())
+        between = [ly for ly in lines if lo < ly < hi and ly not in occupied]
+        between.sort(key=lambda ly: abs(ly - y_e2))
+        missing = [tag for tag in ("E1", "T1") if tag not in assigned_y]
+        if len(between) == len(missing) and 0 < len(missing) <= 2:
+            for tag, ly in zip(missing, between):
+                assigned_y[tag] = ly
+
+    result: Dict[str, float] = {}
+    for tag, ly in assigned_y.items():
+        value = _ocr_dark_price_near_y(img, ly)
+        if value is not None:
+            result[tag.lower()] = value
+    return result
+
+
 def normalize_number(raw: Optional[str]) -> Optional[float]:
     if raw is None:
         return None
@@ -379,6 +560,7 @@ def extract_tag_value(text: str, tag: str) -> Optional[float]:
         "S2": r"(?:S|\$)\s*2",
         "T1": r"T\s*1",
         "T2": r"T\s*2",
+        "T3": r"T\s*3",
     }
     m = re.search(aliases[tag] + r"\s*[:=]?\s*([0-9][0-9.,]*)", text, flags=re.I)
     return normalize_number(m.group(1)) if m else None
@@ -444,6 +626,7 @@ def parse_signal(full_text: str, top_text: str) -> Dict[str, Any]:
         "s2": extract_tag_value(combined, "S2"),
         "t1": extract_tag_value(combined, "T1"),
         "t2": extract_tag_value(combined, "T2"),
+        "t3": extract_tag_value(combined, "T3"),
     }
 
 
@@ -581,6 +764,12 @@ def _edit_signal_body(row: Dict[str, Any], key_prefix: str) -> None:
         "Puoi correggere segnale, origine, conferme, livelli e note. "
         "Da qui puoi anche registrare Entry e Stop reali quando il setup diventa operativo."
     )
+    use_t3_edit = st.checkbox(
+        "Usa T3 (raro)",
+        value=_numeric_or_none(row.get("t3")) is not None,
+        key=f"{key_prefix}_use_t3_{sid}",
+        help="Attivalo solo quando questo segnale prevede realmente un terzo target.",
+    )
 
     with st.form(f"{key_prefix}_edit_signal_{sid}"):
         st.markdown("#### Segnale originale")
@@ -605,9 +794,16 @@ def _edit_signal_body(row: Dict[str, Any], key_prefix: str) -> None:
         s1_edit = normalize_number(a2.text_input("S1 indicativo", fmt_num(row.get("s1")), key=f"{key_prefix}_s1_{sid}"))
         e2_edit = normalize_number(a3.text_input("E2 indicativa", fmt_num(row.get("e2")), key=f"{key_prefix}_e2_{sid}"))
         s2_edit = normalize_number(a4.text_input("S2 indicativo", fmt_num(row.get("s2")), key=f"{key_prefix}_s2_{sid}"))
-        b1, b2 = st.columns(2)
-        t1_edit = normalize_number(b1.text_input("T1", fmt_num(row.get("t1")), key=f"{key_prefix}_t1_{sid}"))
-        t2_edit = normalize_number(b2.text_input("T2", fmt_num(row.get("t2")), key=f"{key_prefix}_t2_{sid}"))
+        if use_t3_edit:
+            b1, b2, b3 = st.columns(3)
+            t1_edit = normalize_number(b1.text_input("T1", fmt_num(row.get("t1")), key=f"{key_prefix}_t1_{sid}"))
+            t2_edit = normalize_number(b2.text_input("T2", fmt_num(row.get("t2")), key=f"{key_prefix}_t2_{sid}"))
+            t3_edit = normalize_number(b3.text_input("T3", fmt_num(row.get("t3")), key=f"{key_prefix}_t3_{sid}"))
+        else:
+            b1, b2 = st.columns(2)
+            t1_edit = normalize_number(b1.text_input("T1", fmt_num(row.get("t1")), key=f"{key_prefix}_t1_{sid}"))
+            t2_edit = normalize_number(b2.text_input("T2", fmt_num(row.get("t2")), key=f"{key_prefix}_t2_{sid}"))
+            t3_edit = None
 
         st.markdown("#### Contesto del setup")
         c1, c2, c3 = st.columns(3)
@@ -680,7 +876,7 @@ def _edit_signal_body(row: Dict[str, Any], key_prefix: str) -> None:
             "ticker": ticker_edit.strip(),
             "direction": direction_edit,
             "e1": e1_edit, "s1": s1_edit, "e2": e2_edit, "s2": s2_edit,
-            "t1": t1_edit, "t2": t2_edit,
+            "t1": t1_edit, "t2": t2_edit, "t3": t3_edit,
             "setup_origin": setup_origin_edit,
             "reference_area": reference_area_edit.strip(),
             "setup_timeframe": setup_tf_edit,
@@ -705,6 +901,7 @@ def _edit_signal_body(row: Dict[str, Any], key_prefix: str) -> None:
                     or _num_changed(row.get("actual_stop"), actual_stop_edit)
                     or _num_changed(row.get("t1"), t1_edit)
                     or _num_changed(row.get("t2"), t2_edit)
+                    or _num_changed(row.get("t3"), t3_edit)
                     or str(row.get("direction") or "") != direction_edit
                     or str(row.get("ticker") or "").strip() != ticker_edit.strip()
                     or old_entry_dt.replace(microsecond=0) != new_entry_dt.replace(microsecond=0)
@@ -716,6 +913,7 @@ def _edit_signal_body(row: Dict[str, Any], key_prefix: str) -> None:
                 "outcome": None,
                 "t1_hit_time": None,
                 "t2_hit_time": None,
+                "t3_hit_time": None,
                 "stop_hit_time": None,
                 "result_note": "Ingresso/dati trade registrati o corretti; monitoraggio da ricalcolare",
                 "last_check": None,
@@ -903,31 +1101,28 @@ def get_market_quote(ticker: str, allow_fetch: bool = True) -> Tuple[Optional[fl
 
 
 def active_target_distance(row: Dict[str, Any], current_price: Optional[float]) -> Tuple[Optional[str], Optional[float], Optional[float]]:
-    """Restituisce target attivo (T1/T2), distanza in punti e percentuale dal prezzo corrente.
-
-    Il target attivo viene deciso dallo STATO operativo, non dalla semplice
-    presenza dei timestamp. Nei DataFrame pandas i valori mancanti dei timestamp
-    possono diventare NaN/NaT e risultare truthy in un controllo booleano,
-    facendo apparire erroneamente T2 prima che T1 sia stato raggiunto.
-    """
+    """Restituisce il prossimo target attivo (T1/T2/T3), distanza in punti e percentuale."""
     if current_price is None:
         return None, None, None
     status = str(row.get("status") or "")
-    if status not in {"IN TRADE", "T1 RAGGIUNTO"}:
+    if status not in {"IN TRADE", "T1 RAGGIUNTO", "T2 RAGGIUNTO"}:
         return None, None, None
 
-    if status == "T1 RAGGIUNTO":
+    if status == "T2 RAGGIUNTO":
+        label = "T3"
+        target = row.get("t3")
+    elif status == "T1 RAGGIUNTO":
         label = "T2"
         target = row.get("t2")
     else:
         label = "T1"
         target = row.get("t1")
 
-    if target is None:
+    target_value = _numeric_or_none(target)
+    if target_value is None:
         return None, None, None
     try:
         price = float(current_price)
-        target_value = float(target)
     except Exception:
         return None, None, None
     if price == 0:
@@ -948,9 +1143,12 @@ def format_target_distance(row: Dict[str, Any], current_price: Optional[float]) 
 
 
 def open_trade_status_label(row: Dict[str, Any]) -> str:
-    if str(row.get("status") or "") == "T1 RAGGIUNTO":
+    status = str(row.get("status") or "")
+    if status == "T1 RAGGIUNTO":
         return "T1 OK - T2 IN ATTESA"
-    return str(row.get("status") or "—")
+    if status == "T2 RAGGIUNTO":
+        return "T2 OK - T3 IN ATTESA"
+    return status or "—"
 
 
 def evaluate_trade(row: Dict[str, Any]) -> Dict[str, Optional[str]]:
@@ -969,10 +1167,6 @@ def evaluate_trade(row: Dict[str, Any]) -> Dict[str, Optional[str]]:
     try:
         closes = df["Close"].dropna()
         if not closes.empty:
-            # La freschezza della cache deve riferirsi al momento in cui abbiamo
-            # recuperato il dato, non all'orario della barra Yahoo. I futures
-            # possono essere ritardati: usando l'orario della barra la quote
-            # veniva subito considerata "scaduta" e Dashboard mostrava —.
             market_ts = closes.index[-1]
             source = f"Yahoo Finance · ultimo dato {market_ts}"
             _store_market_quote(str(row["ticker"]), float(closes.iloc[-1]), local_now(), source)
@@ -981,13 +1175,16 @@ def evaluate_trade(row: Dict[str, Any]) -> Dict[str, Optional[str]]:
 
     direction = str(row["direction"]).upper()
     stop = float(row["actual_stop"])
-    t1 = float(row["t1"]) if row.get("t1") is not None else None
-    t2 = float(row["t2"]) if row.get("t2") is not None else None
+    t1 = _numeric_or_none(row.get("t1"))
+    t2 = _numeric_or_none(row.get("t2"))
+    t3 = _numeric_or_none(row.get("t3"))
     t1_time = row.get("t1_hit_time")
     t2_time = row.get("t2_hit_time")
+    t3_time = row.get("t3_hit_time")
     stop_time = row.get("stop_hit_time")
     t1_done = bool(t1_time)
     t2_done = bool(t2_time)
+    t3_done = bool(t3_time)
 
     for ts, bar in df.iterrows():
         high, low = float(bar["High"]), float(bar["Low"])
@@ -995,48 +1192,88 @@ def evaluate_trade(row: Dict[str, Any]) -> Dict[str, Optional[str]]:
             hit_stop = low <= stop
             hit_t1 = t1 is not None and high >= t1 and not t1_done
             hit_t2 = t2 is not None and high >= t2 and not t2_done
+            hit_t3 = t3 is not None and high >= t3 and not t3_done
         else:
             hit_stop = high >= stop
             hit_t1 = t1 is not None and low <= t1 and not t1_done
             hit_t2 = t2 is not None and low <= t2 and not t2_done
+            hit_t3 = t3 is not None and low <= t3 and not t3_done
 
-        if hit_stop and (hit_t1 or hit_t2):
+        if hit_stop and (hit_t1 or hit_t2 or hit_t3):
+            if t2_done:
+                ambiguous_outcome = "AMBIGUO DOPO T2"
+            elif t1_done:
+                ambiguous_outcome = "AMBIGUO DOPO T1"
+            else:
+                ambiguous_outcome = "AMBIGUO"
             return {
                 "status": "AMBIGUO",
-                "outcome": "AMBIGUO DOPO T1" if t1_done else "AMBIGUO",
+                "outcome": ambiguous_outcome,
                 "t1_hit_time": t1_time,
                 "t2_hit_time": t2_time,
+                "t3_hit_time": t3_time,
                 "stop_hit_time": stop_time,
                 "note": f"Stop e target nella stessa barra {interval}; ordine non determinabile.",
             }
+
         if hit_t1:
             t1_done = True
             t1_time = ts.isoformat()
         if hit_t2:
             t2_done = True
             t2_time = ts.isoformat()
+        if hit_t3:
+            t3_done = True
+            t3_time = ts.isoformat()
             return {
-                "status": "CHIUSO", "outcome": "T2", "t1_hit_time": t1_time,
-                "t2_hit_time": t2_time, "stop_hit_time": stop_time,
+                "status": "CHIUSO", "outcome": "T3",
+                "t1_hit_time": t1_time, "t2_hit_time": t2_time, "t3_hit_time": t3_time,
+                "stop_hit_time": stop_time,
+                "note": f"T3 raggiunto; controllo con barre {interval}.",
+            }
+
+        # Se T3 non è previsto, T2 resta il target finale come nelle versioni precedenti.
+        if hit_t2 and t3 is None:
+            return {
+                "status": "CHIUSO", "outcome": "T2",
+                "t1_hit_time": t1_time, "t2_hit_time": t2_time, "t3_hit_time": t3_time,
+                "stop_hit_time": stop_time,
                 "note": f"T2 raggiunto; controllo con barre {interval}.",
             }
+
         if hit_stop:
             stop_time = ts.isoformat()
+            if t2_done:
+                outcome = "T2 + STOP"
+            elif t1_done:
+                outcome = "T1 + STOP"
+            else:
+                outcome = "STOP"
             return {
-                "status": "CHIUSO", "outcome": "T1 + STOP" if t1_done else "STOP",
-                "t1_hit_time": t1_time, "t2_hit_time": t2_time, "stop_hit_time": stop_time,
+                "status": "CHIUSO", "outcome": outcome,
+                "t1_hit_time": t1_time, "t2_hit_time": t2_time, "t3_hit_time": t3_time,
+                "stop_hit_time": stop_time,
                 "note": f"Stop raggiunto; controllo con barre {interval}.",
             }
 
+    if t2_done and t3 is not None:
+        return {
+            "status": "T2 RAGGIUNTO", "outcome": None,
+            "t1_hit_time": t1_time, "t2_hit_time": t2_time, "t3_hit_time": t3_time,
+            "stop_hit_time": stop_time,
+            "note": f"T2 raggiunto; T3 ancora in attesa. Controllo con barre {interval}.",
+        }
     if t1_done:
         return {
-            "status": "T1 RAGGIUNTO", "outcome": None, "t1_hit_time": t1_time,
-            "t2_hit_time": t2_time, "stop_hit_time": stop_time,
+            "status": "T1 RAGGIUNTO", "outcome": None,
+            "t1_hit_time": t1_time, "t2_hit_time": t2_time, "t3_hit_time": t3_time,
+            "stop_hit_time": stop_time,
             "note": f"T1 raggiunto; T2 ancora in attesa. Controllo con barre {interval}.",
         }
     return {
-        "status": "IN TRADE", "outcome": None, "t1_hit_time": t1_time,
-        "t2_hit_time": t2_time, "stop_hit_time": stop_time,
+        "status": "IN TRADE", "outcome": None,
+        "t1_hit_time": t1_time, "t2_hit_time": t2_time, "t3_hit_time": t3_time,
+        "stop_hit_time": stop_time,
         "note": f"T1 non ancora raggiunto; controllo con barre {interval}.",
     }
 
@@ -1045,7 +1282,7 @@ def update_all_open_trades() -> Tuple[int, List[str]]:
     df = load_signals()
     if df.empty:
         return 0, []
-    df = df[df["status"].isin(["IN TRADE", "T1 RAGGIUNTO"])]
+    df = df[df["status"].isin(["IN TRADE", "T1 RAGGIUNTO", "T2 RAGGIUNTO"])]
     updated = 0
     notes: List[str] = []
     for _, r in df.iterrows():
@@ -1060,6 +1297,7 @@ def update_all_open_trades() -> Tuple[int, List[str]]:
                 outcome=res.get("outcome"),
                 t1_hit_time=res.get("t1_hit_time"),
                 t2_hit_time=res.get("t2_hit_time"),
+                t3_hit_time=res.get("t3_hit_time"),
                 stop_hit_time=res.get("stop_hit_time"),
                 result_note=res.get("note", ""),
                 last_check=now_iso(),
@@ -1078,6 +1316,7 @@ STATUS_DISPLAY = {
     "PUBBLICATO": "IDEA / IN ATTESA",
     "IN TRADE": "TRADE ATTIVATO",
     "T1 RAGGIUNTO": "TRADE ATTIVATO · T1",
+    "T2 RAGGIUNTO": "TRADE ATTIVATO · T2",
     "NESSUN TRADE": "NON ATTIVATO",
     "ANNULLATO": "ANNULLATO",
     "CHIUSO": "CHIUSO",
@@ -1094,7 +1333,7 @@ def dataframe_for_display(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     if "instrument" in out.columns:
         out["instrument"] = out["instrument"].map(canonical_instrument_label)
-    for c in ["e1", "s1", "e2", "s2", "t1", "t2", "actual_entry", "actual_stop"]:
+    for c in ["e1", "s1", "e2", "s2", "t1", "t2", "t3", "actual_entry", "actual_stop"]:
         if c in out.columns:
             out[c] = out[c].map(lambda x: "—" if pd.isna(x) else fmt_num(x))
     if "confirmations" in out.columns:
@@ -1105,13 +1344,16 @@ def dataframe_for_display(df: pd.DataFrame) -> pd.DataFrame:
         )
     if "status" in out.columns:
         out["status"] = out["status"].map(operational_status_label)
-    cols = [
-        "id", "valid_date", "instrument", "direction", "e1", "e2", "t1", "t2",
-        "setup_origin", "confirmations", "actual_entry", "actual_stop", "status", "outcome",
-    ]
+    show_t3 = False
+    if "t3" in df.columns:
+        show_t3 = any(_numeric_or_none(v) is not None for v in df["t3"].tolist())
+    cols = ["id", "valid_date", "instrument", "direction", "e1", "e2", "t1", "t2"]
+    if show_t3:
+        cols.append("t3")
+    cols.extend(["setup_origin", "confirmations", "actual_entry", "actual_stop", "status", "outcome"])
     return out[[c for c in cols if c in out.columns]].rename(columns={
         "id": "ID", "valid_date": "Data", "instrument": "Strumento", "direction": "Dir.",
-        "e1": "E1", "e2": "E2", "t1": "T1", "t2": "T2", "setup_origin": "Origine",
+        "e1": "E1", "e2": "E2", "t1": "T1", "t2": "T2", "t3": "T3", "setup_origin": "Origine",
         "confirmations": "Conferme", "actual_entry": "Entry reale", "actual_stop": "Stop reale",
         "status": "Stato", "outcome": "Esito",
     })
@@ -1148,6 +1390,13 @@ def styled_signals_dataframe(df: pd.DataFrame, quotes: Optional[Dict[str, float]
         if status == "T1 RAGGIUNTO":
             display.at[idx, "Stato"] = "T1 OK - T2 IN ATTESA"
             display.at[idx, "Esito"] = "—"
+        elif status == "T2 RAGGIUNTO":
+            if _numeric_or_none(raw.get("t3")) is not None:
+                display.at[idx, "Stato"] = "T2 OK - T3 IN ATTESA"
+                display.at[idx, "Esito"] = "—"
+            else:
+                display.at[idx, "Stato"] = "CHIUSO"
+                display.at[idx, "Esito"] = "T2"
         elif str(raw.get("outcome") or "") == "T1 APERTO":
             # Compatibilità con record salvati dalle versioni precedenti.
             display.at[idx, "Esito"] = "—"
@@ -1160,7 +1409,7 @@ def styled_signals_dataframe(df: pd.DataFrame, quotes: Optional[Dict[str, float]
         if price is not None:
             # Il prezzo corrente è utile anche quando il segnale è ancora IDEA / IN ATTESA.
             display.at[idx, "Prezzo attuale"] = f"{float(price):.1f}"
-            if status in {"IN TRADE", "T1 RAGGIUNTO"}:
+            if status in {"IN TRADE", "T1 RAGGIUNTO", "T2 RAGGIUNTO"}:
                 display.at[idx, "Dist. target"] = format_target_distance(raw, price)
 
     # La distanza resta vicino allo Stato; prezzo attuale e collegamento TradingView
@@ -1192,13 +1441,17 @@ def styled_signals_dataframe(df: pd.DataFrame, quotes: Optional[Dict[str, float]
 
         # Evidenzia target/stop solo in base all'esito operativo conclusivo.
         # Evita falsi positivi causati da NaN/NaT nei timestamp del DataFrame.
-        if status == "CHIUSO" and outcome == "T2":
+        if status == "T2 RAGGIUNTO" or (status == "CHIUSO" and outcome in {"T2", "T3", "T2 + STOP"}):
             set_style("T2", "background-color: #0b7a3b; color: white; font-weight: 700;")
+        if status == "CHIUSO" and outcome == "T3":
+            set_style("T3", "background-color: #0b7a3b; color: white; font-weight: 700;")
         if status == "CHIUSO" and "STOP" in outcome:
             set_style("Stop reale", "background-color: #8b2f2f; color: white; font-weight: 700;")
         if status == "T1 RAGGIUNTO":
             css = "background-color: #1f6f3d; color: white; font-weight: 700;"
-        elif status == "CHIUSO" and outcome == "T2":
+        elif status == "T2 RAGGIUNTO":
+            css = "background-color: #0b7a3b; color: white; font-weight: 700;"
+        elif status == "CHIUSO" and outcome in {"T2", "T3"}:
             css = "background-color: #0b7a3b; color: white; font-weight: 700;"
         elif status == "CHIUSO" and "STOP" in outcome:
             css = "background-color: #8b2f2f; color: white; font-weight: 700;"
@@ -1222,7 +1475,7 @@ def dashboard_quotes(df: pd.DataFrame, allow_fetch: bool) -> Dict[str, float]:
     quotes: Dict[str, float] = {}
     if df.empty:
         return quotes
-    active_statuses = {"PUBBLICATO", "IN TRADE", "T1 RAGGIUNTO"}
+    active_statuses = {"PUBBLICATO", "IN TRADE", "T1 RAGGIUNTO", "T2 RAGGIUNTO"}
     active_df = df[df["status"].isin(active_statuses)] if "status" in df else pd.DataFrame()
     if active_df.empty:
         return quotes
@@ -1396,7 +1649,14 @@ def page_new_signal() -> None:
             with st.spinner("Lettura OCR in corso..."):
                 full_text, top_text = run_ocr(img)
                 parsed = parse_signal(full_text, top_text)
-                st.session_state["ocr_data"] = {**parsed, "full_text": full_text, "top_text": top_text}
+                chart_levels = extract_chart_levels_from_lines(img)
+                for field in ("e1", "s1", "e2", "s2", "t1", "t2", "t3"):
+                    if parsed.get(field) is None and chart_levels.get(field) is not None:
+                        parsed[field] = chart_levels[field]
+                st.session_state["ocr_data"] = {
+                    **parsed, "full_text": full_text, "top_text": top_text,
+                    "chart_levels": chart_levels,
+                }
                 st.session_state["ocr_error"] = None
         except Exception as e:
             st.session_state["ocr_error"] = str(e)
@@ -1407,9 +1667,16 @@ def page_new_signal() -> None:
 
     ocr = st.session_state.get("ocr_data") or {
         "valid_date": None, "instrument": "", "ticker": "", "direction": "",
-        "e1": None, "s1": None, "e2": None, "s2": None, "t1": None, "t2": None,
-        "full_text": "", "top_text": "",
+        "e1": None, "s1": None, "e2": None, "s2": None, "t1": None, "t2": None, "t3": None,
+        "full_text": "", "top_text": "", "chart_levels": {},
     }
+
+    use_t3 = st.checkbox(
+        "Usa T3 (raro)",
+        value=_numeric_or_none(ocr.get("t3")) is not None,
+        key=f"new_use_t3_{file_hash}",
+        help="Lascia disattivato normalmente. Attivalo solo quando il segnale prevede davvero un terzo target.",
+    )
 
     with st.form("signal_form"):
         st.markdown("#### 1. Segnale originale")
@@ -1429,9 +1696,16 @@ def page_new_signal() -> None:
         s1 = normalize_number(a2.text_input("S1 indicativo", fmt_num(ocr.get("s1"))))
         e2 = normalize_number(a3.text_input("E2 indicativa", fmt_num(ocr.get("e2"))))
         s2 = normalize_number(a4.text_input("S2 indicativo", fmt_num(ocr.get("s2"))))
-        b1, b2 = st.columns(2)
-        t1 = normalize_number(b1.text_input("T1", fmt_num(ocr.get("t1"))))
-        t2 = normalize_number(b2.text_input("T2", fmt_num(ocr.get("t2"))))
+        if use_t3:
+            b1, b2, b3 = st.columns(3)
+            t1 = normalize_number(b1.text_input("T1", fmt_num(ocr.get("t1"))))
+            t2 = normalize_number(b2.text_input("T2", fmt_num(ocr.get("t2"))))
+            t3 = normalize_number(b3.text_input("T3", fmt_num(ocr.get("t3"))))
+        else:
+            b1, b2 = st.columns(2)
+            t1 = normalize_number(b1.text_input("T1", fmt_num(ocr.get("t1"))))
+            t2 = normalize_number(b2.text_input("T2", fmt_num(ocr.get("t2"))))
+            t3 = None
 
         st.markdown("#### 2. Contesto del setup — facoltativo")
         c1, c2, c3 = st.columns(3)
@@ -1492,7 +1766,7 @@ def page_new_signal() -> None:
                     "instrument": instrument.strip(),
                     "ticker": ticker.strip(),
                     "direction": direction,
-                    "e1": e1, "s1": s1, "e2": e2, "s2": s2, "t1": t1, "t2": t2,
+                    "e1": e1, "s1": s1, "e2": e2, "s2": s2, "t1": t1, "t2": t2, "t3": t3,
                     "setup_origin": setup_origin,
                     "reference_area": reference_area.strip(),
                     "setup_timeframe": setup_tf,
@@ -1511,6 +1785,9 @@ def page_new_signal() -> None:
 
     if ocr.get("full_text"):
         with st.expander("Testo letto dall'OCR"):
+            if ocr.get("chart_levels"):
+                detected = " · ".join(f"{k.upper()} {fmt_num(v)}" for k, v in ocr["chart_levels"].items())
+                st.caption(f"Livelli letti direttamente dalle linee/scala destra: {detected}")
             st.code((ocr.get("top_text", "") + "\n---\n" + ocr.get("full_text", "")).strip())
 
 
@@ -1650,7 +1927,7 @@ def page_dashboard() -> None:
         auto_monitor = st.toggle(
             "Monitoraggio automatico trade aperti (ogni 60 secondi)",
             value=True,
-            help="Attivo solo mentre questa Dashboard resta aperta. Controlla T1, T2 e Stop usando i dati intraday disponibili da Yahoo Finance.",
+            help="Attivo solo mentre questa Dashboard resta aperta. Controlla T1, T2, T3 e Stop usando i dati intraday disponibili da Yahoo Finance.",
         )
     else:
         auto_monitor = False
@@ -1674,31 +1951,36 @@ def page_stats() -> None:
         return
 
     traded = df[df["actual_entry"].notna()].copy()
-    resolved = traded[traded["outcome"].isin(["T2", "T1 + STOP", "STOP"])].copy()
+    resolved_outcomes = ["T3", "T2", "T2 + STOP", "T1 + STOP", "STOP"]
+    resolved = traded[traded["outcome"].isin(resolved_outcomes)].copy()
     if resolved.empty:
         st.info("Non ci sono ancora abbastanza trade risolti per statistiche operative affidabili.")
     else:
-        resolved["win_t1"] = resolved["outcome"].isin(["T2", "T1 + STOP"]).astype(int)
-        resolved["t2_hit"] = (resolved["outcome"] == "T2").astype(int)
-        c1, c2, c3 = st.columns(3)
+        resolved["win_t1"] = resolved["outcome"].isin(["T3", "T2", "T2 + STOP", "T1 + STOP"]).astype(int)
+        resolved["t2_hit"] = resolved["outcome"].isin(["T3", "T2", "T2 + STOP"]).astype(int)
+        resolved["t3_hit"] = (resolved["outcome"] == "T3").astype(int)
+        c1, c2, c3, c4 = st.columns(4)
         c1.metric("Trade risolti", len(resolved))
         c2.metric("T1 prima dello Stop", f"{resolved['win_t1'].mean()*100:.1f}%")
         c3.metric("T2 raggiunto", f"{resolved['t2_hit'].mean()*100:.1f}%")
+        c4.metric("T3 raggiunto", f"{resolved['t3_hit'].mean()*100:.1f}%")
 
         st.markdown("#### Risultati per origine del setup")
         by_origin = resolved.groupby("setup_origin", dropna=False).agg(
-            Trade=("id", "count"), WinRate_T1=("win_t1", "mean"), T2=("t2_hit", "mean")
+            Trade=("id", "count"), WinRate_T1=("win_t1", "mean"), T2=("t2_hit", "mean"), T3=("t3_hit", "mean")
         ).reset_index()
         by_origin["WinRate_T1"] = (by_origin["WinRate_T1"] * 100).round(1)
         by_origin["T2"] = (by_origin["T2"] * 100).round(1)
+        by_origin["T3"] = (by_origin["T3"] * 100).round(1)
         st.dataframe(by_origin, use_container_width=True, hide_index=True)
 
         st.markdown("#### Risultati per strumento")
         by_instr = resolved.groupby("instrument").agg(
-            Trade=("id", "count"), WinRate_T1=("win_t1", "mean"), T2=("t2_hit", "mean")
+            Trade=("id", "count"), WinRate_T1=("win_t1", "mean"), T2=("t2_hit", "mean"), T3=("t3_hit", "mean")
         ).reset_index().sort_values(["Trade", "WinRate_T1"], ascending=[False, False])
         by_instr["WinRate_T1"] = (by_instr["WinRate_T1"] * 100).round(1)
         by_instr["T2"] = (by_instr["T2"] * 100).round(1)
+        by_instr["T3"] = (by_instr["T3"] * 100).round(1)
         st.dataframe(by_instr, use_container_width=True, hide_index=True)
 
         st.markdown("#### Conferme osservate")
@@ -1706,13 +1988,15 @@ def page_stats() -> None:
         if ex.empty:
             st.caption("Nessuna conferma facoltativa registrata nei trade risolti.")
         else:
-            ex["win_t1"] = ex["outcome"].isin(["T2", "T1 + STOP"]).astype(int)
-            ex["t2_hit"] = (ex["outcome"] == "T2").astype(int)
+            ex["win_t1"] = ex["outcome"].isin(["T3", "T2", "T2 + STOP", "T1 + STOP"]).astype(int)
+            ex["t2_hit"] = ex["outcome"].isin(["T3", "T2", "T2 + STOP"]).astype(int)
+            ex["t3_hit"] = (ex["outcome"] == "T3").astype(int)
             by_conf = ex.groupby("confirmation").agg(
-                Presenze=("confirmation", "size"), WinRate_T1=("win_t1", "mean"), T2=("t2_hit", "mean")
+                Presenze=("confirmation", "size"), WinRate_T1=("win_t1", "mean"), T2=("t2_hit", "mean"), T3=("t3_hit", "mean")
             ).reset_index().sort_values("Presenze", ascending=False)
             by_conf["WinRate_T1"] = (by_conf["WinRate_T1"] * 100).round(1)
             by_conf["T2"] = (by_conf["T2"] * 100).round(1)
+            by_conf["T3"] = (by_conf["T3"] * 100).round(1)
             st.dataframe(by_conf, use_container_width=True, hide_index=True)
 
     st.markdown("#### Nota metodologica")
