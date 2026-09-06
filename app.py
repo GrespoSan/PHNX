@@ -20,7 +20,7 @@ import yfinance as yf
 from supabase import create_client, Client
 
 APP_NAME = "G. Signal Tracker"
-APP_VERSION = "V4.4"
+APP_VERSION = "V4.5"
 BUCKET_NAME = "signal-screenshots"
 LOCAL_TZ = ZoneInfo("Europe/Rome")
 
@@ -704,7 +704,7 @@ def _normalize_confirmation_code_token(line: str) -> Optional[str]:
     compact = re.sub(r"[^A-Z0-9]", "", str(line or "").upper())
     if not compact:
         return None
-    if compact.startswith("STOC") or compact in {"STOCTDI", "STOCITD", "STOCTD"}:
+    if compact.startswith("STOC") or compact in {"STOCTDI", "STOCITD", "STOCTD", "STOTDI"}:
         return "STOC/TDI"
     if compact == "MM":
         return "MM"
@@ -746,23 +746,200 @@ def extract_confirmation_codes_by_row(text: str) -> Dict[str, str]:
     return out
 
 
-def _checked_rows_from_table_image(img: Image.Image) -> List[str]:
-    """Rileva le X nella quarta colonna senza affidarsi all'OCR della lettera X.
+def _detect_signal_table_bbox(img: Image.Image) -> Optional[Tuple[int, int, int, int]]:
+    """Trova automaticamente la tabella azzurra, ovunque sia posizionata nello screenshot.
 
-    Il nuovo template ha la tabella stabilmente in alto a destra. Usiamo coordinate
-    relative, quindi funziona anche se lo screenshot viene ridimensionato.
+    Il template usa un fondo azzurro molto chiaro. Lavoriamo su una copia ridotta e
+    cerchiamo la componente con area, densità e proporzioni compatibili con la griglia.
+    Non usiamo coordinate fisse: la tabella può essere spostata sul grafico.
     """
-    arr = np.array(img.convert("RGB"))
-    h, w, _ = arr.shape
-    # Bounding box del riquadro tabella nel nuovo template.
-    x_left, x_right = int(w * 0.632), int(w * 0.826)
-    y_top, y_bottom = int(h * 0.036), int(h * 0.249)
-    if x_right <= x_left or y_bottom <= y_top:
-        return []
+    max_w = 900
+    scale = min(1.0, max_w / max(1, img.width))
+    work = img if scale >= 0.999 else img.resize((max(1, int(img.width * scale)), max(1, int(img.height * scale))))
+    arr = np.array(work.convert("RGB"))
+    rr = arr[:, :, 0].astype(np.int16)
+    gg = arr[:, :, 1].astype(np.int16)
+    bb = arr[:, :, 2].astype(np.int16)
 
+    # Fondo della tabella: chiaro, con dominante blu. Esclude trendline ciano e box scuri.
+    mask = (rr > 160) & (gg > 170) & (bb > 190) & ((bb - rr) > 10) & ((bb - gg) > 4)
+    h, w = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    candidates: List[Tuple[float, int, int, int, int]] = []
+
+    for y in range(h):
+        for x in range(w):
+            if not mask[y, x] or seen[y, x]:
+                continue
+            stack = [(y, x)]
+            seen[y, x] = True
+            min_x = max_x = x
+            min_y = max_y = y
+            count = 0
+            while stack:
+                yy, xx = stack.pop()
+                count += 1
+                min_x = min(min_x, xx); max_x = max(max_x, xx)
+                min_y = min(min_y, yy); max_y = max(max_y, yy)
+                for dy, dx in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                    ny, nx = yy + dy, xx + dx
+                    if 0 <= ny < h and 0 <= nx < w and mask[ny, nx] and not seen[ny, nx]:
+                        seen[ny, nx] = True
+                        stack.append((ny, nx))
+
+            bw = max_x - min_x + 1
+            bh = max_y - min_y + 1
+            if bw < max(70, int(w * 0.08)) or bh < max(45, int(h * 0.07)):
+                continue
+            aspect = bw / max(1, bh)
+            density = count / max(1, bw * bh)
+            if not (1.15 <= aspect <= 5.0 and density >= 0.35):
+                continue
+            score = float(count) * density
+            candidates.append((score, min_x, min_y, max_x, max_y))
+
+    if not candidates:
+        return None
+    _, min_x, min_y, max_x, max_y = max(candidates, key=lambda item: item[0])
+    inv = 1.0 / scale
+    x0 = max(0, int(round(min_x * inv)) - 2)
+    y0 = max(0, int(round(min_y * inv)) - 2)
+    x1 = min(img.width, int(round((max_x + 1) * inv)) + 2)
+    y1 = min(img.height, int(round((max_y + 1) * inv)) + 2)
+    return (x0, y0, x1, y1)
+
+
+def _ocr_signal_table_text(img: Image.Image, bbox: Tuple[int, int, int, int]) -> str:
+    """OCR dedicato alla sola tabella, dopo averla individuata automaticamente."""
+    crop = ImageOps.grayscale(img.crop(bbox))
+    scale = 4
+    crop = crop.resize((crop.width * scale, crop.height * scale))
+    arr = np.array(crop)
+    # Soglia più scura: elimina quasi tutta la griglia azzurra e lascia testo/numeri.
+    bw = Image.fromarray(np.where(arr < 160, 0, 255).astype("uint8"))
+    return pytesseract.image_to_string(bw, config="--psm 11")
+
+
+def _ocr_table_context_text(img: Image.Image, bbox: Tuple[int, int, int, int]) -> str:
+    """Legge i box colorati (strumento/data e Timeframe) vicini alla tabella.
+
+    Il box Timeframe ha testo bianco su fondo blu/viola: un OCR generale spesso lo
+    perde. Individuiamo quindi i rettangoli scuri colorati vicino alla tabella,
+    li invertiamo e li leggiamo singolarmente. La posizione assoluta non conta.
+    """
+    x0, y0, x1, y1 = bbox
+    bw = x1 - x0
+    bh = y1 - y0
+    nx0 = max(0, x0 - int(bw * 0.30))
+    nx1 = min(img.width, x1 + int(bw * 1.20))
+    ny0 = max(0, y0 - int(bh * 0.30))
+    ny1 = min(img.height, y0 + int(bh * 0.60))
+
+    arr = np.array(img.crop((nx0, ny0, nx1, ny1)).convert("RGB"))
+    rr = arr[:, :, 0].astype(np.int16)
+    gg = arr[:, :, 1].astype(np.int16)
+    bb = arr[:, :, 2].astype(np.int16)
+    # Blu/viola scuro dei due box del template; esclude quasi tutto il grafico.
+    mask = (bb > 80) & ((bb - rr) > 25) & ((bb - gg) > 15) & (rr < 120) & (gg < 150)
+    h, w = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    comps: List[Tuple[int, int, int, int, int]] = []
+    for y in range(h):
+        for x in range(w):
+            if not mask[y, x] or seen[y, x]:
+                continue
+            stack = [(y, x)]
+            seen[y, x] = True
+            min_x = max_x = x; min_y = max_y = y; count = 0
+            while stack:
+                yy, xx = stack.pop(); count += 1
+                min_x = min(min_x, xx); max_x = max(max_x, xx)
+                min_y = min(min_y, yy); max_y = max(max_y, yy)
+                for dy, dx in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                    cy, cx = yy + dy, xx + dx
+                    if 0 <= cy < h and 0 <= cx < w and mask[cy, cx] and not seen[cy, cx]:
+                        seen[cy, cx] = True; stack.append((cy, cx))
+            cw = max_x - min_x + 1; ch = max_y - min_y + 1
+            density = count / max(1, cw * ch)
+            if cw >= max(60, int(bw * 0.30)) and ch >= max(12, int(bh * 0.06)) and cw / max(1, ch) >= 2.0 and density >= 0.35:
+                comps.append((count, min_x, min_y, max_x, max_y))
+
+    texts: List[str] = []
+    for _, min_x, min_y, max_x, max_y in sorted(comps, key=lambda c: (c[2], c[1]))[:6]:
+        bx0 = max(0, nx0 + min_x - 2); by0 = max(0, ny0 + min_y - 2)
+        bx1 = min(img.width, nx0 + max_x + 3); by1 = min(img.height, ny0 + max_y + 3)
+        crop = ImageOps.grayscale(img.crop((bx0, by0, bx1, by1)))
+        crop = ImageOps.invert(crop).resize((crop.width * 5, crop.height * 5))
+        crop = ImageEnhance.Contrast(crop).enhance(2.0)
+        try:
+            txt = pytesseract.image_to_string(crop, config="--psm 7").strip()
+        except Exception:
+            txt = ""
+        if txt:
+            texts.append(txt)
+    return "\n".join(texts)
+
+def _table_row_segments(text: str) -> Dict[str, List[str]]:
+    """Divide il testo OCR della tabella nelle righe E1/E2/T1/T2/T3/STOP."""
+    lines = [re.sub(r"\s+", " ", ln.strip()) for ln in str(text or "").splitlines() if ln.strip()]
+    wanted = ["E1", "E2", "T1", "T2", "T3", "STOP"]
+    found: List[Tuple[str, int]] = []
+    for i, line in enumerate(lines):
+        compact = re.sub(r"[^A-Z0-9]", "", line.upper())
+        if compact in wanted:
+            found.append((compact, i))
+    # Se Tesseract duplica un'etichetta, teniamo la prima occorrenza utile.
+    unique: List[Tuple[str, int]] = []
+    seen_tags = set()
+    for tag, pos in found:
+        if tag not in seen_tags:
+            unique.append((tag, pos)); seen_tags.add(tag)
+    unique.sort(key=lambda item: item[1])
+    out: Dict[str, List[str]] = {}
+    for j, (tag, pos) in enumerate(unique):
+        end = unique[j + 1][1] if j + 1 < len(unique) else len(lines)
+        out[tag] = lines[pos + 1:end]
+    return out
+
+
+def _numeric_from_table_segment(lines: List[str]) -> Optional[float]:
+    for line in lines:
+        upper = str(line or "").upper()
+        # Evita che M4 venga interpretato come valore 4.
+        for m in re.finditer(r"(?<![A-Z0-9])([0-9][0-9\s.,]*)(?![A-Z])", upper):
+            value = normalize_number(m.group(1))
+            if value is not None:
+                return value
+    return None
+
+
+def _parse_timeframe_text(text: str) -> str:
+    raw = re.sub(r"\s+", " ", str(text or "")).upper()
+    raw = raw.replace("–", "-").replace("—", "-").replace("−", "-")
+    m = re.search(r"TIME\s*FRAME\s*([0-9]{1,3})\s*[- ]?\s*(MINUTE|MIN|MINUTI|HOUR|H)?", raw)
+    if not m:
+        m = re.search(r"TIMEFRAME\s*([0-9]{1,3})\s*[- ]?\s*(MINUTE|MIN|MINUTI|HOUR|H)?", raw)
+    if m:
+        n = int(m.group(1))
+        unit = (m.group(2) or "MIN").upper()
+        if unit.startswith("H"):
+            return f"{n}H" if f"{n}H" in TIMEFRAMES else "—"
+        return {15: "15m", 30: "30m", 60: "1H", 120: "2H", 240: "4H"}.get(n, "—")
+    if re.search(r"TIME\s*FRAME\s*DAILY|TIMEFRAME\s*DAILY", raw):
+        return "Daily"
+    if re.search(r"TIME\s*FRAME\s*WEEKLY|TIMEFRAME\s*WEEKLY", raw):
+        return "Weekly"
+    if re.search(r"TIME\s*FRAME\s*MONTHLY|TIMEFRAME\s*MONTHLY", raw):
+        return "Monthly"
+    return "—"
+
+
+def _checked_rows_from_table_bbox(img: Image.Image, bbox: Tuple[int, int, int, int]) -> List[str]:
+    """Rileva le X nella quarta colonna usando il bbox reale della tabella."""
+    arr = np.array(img.convert("RGB"))
+    x_left, y_top, x_right, y_bottom = bbox
     row_labels = ["HEADER", "E1", "E2", "T1", "T2", "T3", "STOP"]
-    # Ultima colonna, dove viene disegnata la X.
-    x0 = int(x_left + (x_right - x_left) * 0.91)
+    x0 = int(x_left + (x_right - x_left) * 0.90)
     x1 = max(x0 + 2, x_right - 2)
     checked: List[str] = []
     for r, label in enumerate(row_labels):
@@ -774,28 +951,70 @@ def _checked_rows_from_table_image(img: Image.Image) -> List[str]:
         if cell.size == 0:
             continue
         rr, gg, bb = cell[:, :, 0], cell[:, :, 1], cell[:, :, 2]
-        # La X è grigio/nera; le linee blu della tabella non passano questo filtro.
         dark_neutral = (rr < 145) & (gg < 145) & (bb < 145)
         if label != "HEADER" and int(dark_neutral.sum()) >= 8:
             checked.append(label)
     return checked
 
 
-def extract_confirmations_from_table_image(img: Image.Image, ocr_text: str) -> Optional[List[str]]:
-    """Restituisce le conferme spuntate nel nuovo template; None se la tabella non è riconosciuta."""
-    row_codes = extract_confirmation_codes_by_row(ocr_text)
-    # Richiediamo almeno tre righe riconosciute per evitare falsi positivi su vecchi screenshot.
-    if len(row_codes) < 3:
+def extract_signal_table_data(img: Image.Image) -> Optional[Dict[str, Any]]:
+    """Estrae la nuova tabella in modo posizionale e indipendente dalla sua posizione."""
+    bbox = _detect_signal_table_bbox(img)
+    if not bbox:
         return None
-    checked_rows = _checked_rows_from_table_image(img)
+    table_text = _ocr_signal_table_text(img, bbox)
+    segments = _table_row_segments(table_text)
+    if len(segments) < 3:
+        return None
+
+    values = {tag.lower(): _numeric_from_table_segment(lines) for tag, lines in segments.items()}
+    row_codes: Dict[str, str] = {}
+    for tag, lines in segments.items():
+        for line in lines:
+            code = _normalize_confirmation_code_token(line)
+            if code and code != "RD":
+                row_codes[tag] = code
+                break
+
+    checked_rows = _checked_rows_from_table_bbox(img, bbox)
     confirmations: List[str] = []
     for row_tag in checked_rows:
         code = row_codes.get(row_tag)
         label = CONFIRMATION_CODE_MAP.get(code or "")
         if label and label not in confirmations:
             confirmations.append(label)
-    return confirmations
 
+    context_text = _ocr_table_context_text(img, bbox)
+    header_text = table_text + "\n" + context_text
+    direction_match = re.search(r"\b(LONG|SHORT)\b", header_text, flags=re.I)
+    setup_origin = "Revolving Door" if re.search(r"(?<![A-Z0-9])RD(?![A-Z0-9])", header_text, flags=re.I) else "—"
+    setup_timeframe = _parse_timeframe_text(context_text)
+    shared_stop = values.get("stop")
+
+    return {
+        "bbox": bbox,
+        "table_text": table_text,
+        "context_text": context_text,
+        "valid_date": parse_date(header_text),
+        "direction": direction_match.group(1).upper() if direction_match else "",
+        "e1": values.get("e1"),
+        "e2": values.get("e2"),
+        "t1": values.get("t1"),
+        "t2": values.get("t2"),
+        "t3": values.get("t3"),
+        "shared_stop": shared_stop,
+        "setup_origin": setup_origin,
+        "setup_timeframe": setup_timeframe,
+        "confirmations": confirmations,
+        "row_codes": row_codes,
+        "checked_rows": checked_rows,
+    }
+
+
+def extract_confirmations_from_table_image(img: Image.Image, ocr_text: str = "") -> Optional[List[str]]:
+    """Compatibilità: usa il nuovo rilevamento dinamico della tabella."""
+    data = extract_signal_table_data(img)
+    return None if data is None else list(data.get("confirmations") or [])
 
 def _normalize_instrument_text(value: Any) -> str:
     """Normalizza punteggiatura/spazi OCR per riconoscere in modo robusto gli strumenti."""
@@ -1055,13 +1274,6 @@ def _edit_signal_body(row: Dict[str, Any], key_prefix: str) -> None:
     if str(key_prefix).startswith("dashboard_detail_"):
         st.markdown("#### Modifica segnale")
 
-    use_t3_edit = st.checkbox(
-        "Usa T3",
-        value=_numeric_or_none(row.get("t3")) is not None,
-        key=f"{key_prefix}_use_t3_{sid}",
-        help="Attivalo solo quando questo segnale prevede un terzo target.",
-    )
-
     # ------------------------------------------------------------------
     # Modifica del SEGNALE. Entry/Stop reali NON sono richiesti qui.
     # È lo stesso principio usato in G. Slide Signal MV: si può correggere
@@ -1091,16 +1303,10 @@ def _edit_signal_body(row: Dict[str, Any], key_prefix: str) -> None:
         s1_edit = normalize_number(a2.text_input("S1 indicativo", fmt_num(signal_level_value(row, "s1")), key=f"{key_prefix}_s1_{sid}"))
         e2_edit = normalize_number(a3.text_input("E2 indicativa", fmt_num(signal_level_value(row, "e2")), key=f"{key_prefix}_e2_{sid}"))
         s2_edit = normalize_number(a4.text_input("S2 indicativo", fmt_num(signal_level_value(row, "s2")), key=f"{key_prefix}_s2_{sid}"))
-        if use_t3_edit:
-            b1, b2, b3 = st.columns(3)
-            t1_edit = normalize_number(b1.text_input("T1", fmt_num(signal_level_value(row, "t1")), key=f"{key_prefix}_t1_{sid}"))
-            t2_edit = normalize_number(b2.text_input("T2", fmt_num(signal_level_value(row, "t2")), key=f"{key_prefix}_t2_{sid}"))
-            t3_edit = normalize_number(b3.text_input("T3", fmt_num(signal_level_value(row, "t3")), key=f"{key_prefix}_t3_{sid}"))
-        else:
-            b1, b2 = st.columns(2)
-            t1_edit = normalize_number(b1.text_input("T1", fmt_num(signal_level_value(row, "t1")), key=f"{key_prefix}_t1_{sid}"))
-            t2_edit = normalize_number(b2.text_input("T2", fmt_num(signal_level_value(row, "t2")), key=f"{key_prefix}_t2_{sid}"))
-            t3_edit = None
+        b1, b2, b3 = st.columns(3)
+        t1_edit = normalize_number(b1.text_input("T1", fmt_num(signal_level_value(row, "t1")), key=f"{key_prefix}_t1_{sid}"))
+        t2_edit = normalize_number(b2.text_input("T2", fmt_num(signal_level_value(row, "t2")), key=f"{key_prefix}_t2_{sid}"))
+        t3_edit = normalize_number(b3.text_input("T3", fmt_num(signal_level_value(row, "t3")), key=f"{key_prefix}_t3_{sid}", help="Facoltativo. Se vuoto viene ignorato."))
 
         st.markdown("#### Contesto del setup")
         c1, c2, c3 = st.columns(3)
@@ -1158,8 +1364,8 @@ def _edit_signal_body(row: Dict[str, Any], key_prefix: str) -> None:
             "confirmations": confirmations_edit,
             "notes": notes_edit.strip(),
         }
-        # T3 resta opzionale e compatibile con database non migrati quando non viene usato.
-        if use_t3_edit or _numeric_or_none(row.get("t3")) is not None:
+        # T3 è facoltativo: se non compilato viene ignorato. Se esisteva già, può essere svuotato.
+        if t3_edit is not None or _numeric_or_none(row.get("t3")) is not None:
             updates["t3"] = t3_edit
 
         # Se esiste già un trade reale, una modifica a target/direzione/ticker
@@ -1183,7 +1389,7 @@ def _edit_signal_body(row: Dict[str, Any], key_prefix: str) -> None:
                 "result_note": "Dati del segnale corretti; monitoraggio da ricalcolare",
                 "last_check": None,
             })
-            if use_t3_edit or _numeric_or_none(row.get("t3")) is not None:
+            if t3_edit is not None or _numeric_or_none(row.get("t3")) is not None:
                 updates["t3_hit_time"] = None
 
         try:
@@ -1201,7 +1407,7 @@ def _edit_signal_body(row: Dict[str, Any], key_prefix: str) -> None:
         except Exception as e:
             msg = str(e)
             if "PGRST204" in msg and ("t3" in msg.lower() or "t3_hit_time" in msg.lower()):
-                st.error("T3 richiede la migration Supabase V3.7 (colonne t3 e t3_hit_time). Se non usi T3, lascia disattivato il flag Usa T3.")
+                st.error("Per salvare T3 serve la migration Supabase V3.7 (colonne t3 e t3_hit_time). Se non vuoi usare T3, lascia semplicemente il campo T3 vuoto.")
             else:
                 st.error(f"Modifica non riuscita: {e}")
 
@@ -1247,7 +1453,7 @@ def _edit_signal_body(row: Dict[str, Any], key_prefix: str) -> None:
                     "result_note": "Trade reale registrato o corretto; monitoraggio da ricalcolare",
                     "last_check": None,
                 }
-                if use_t3_edit or _numeric_or_none(row.get("t3")) is not None:
+                if t3_edit is not None or _numeric_or_none(row.get("t3")) is not None:
                     trade_updates["t3_hit_time"] = None
                 try:
                     update_signal(sid, **trade_updates)
@@ -1261,7 +1467,7 @@ def _edit_signal_body(row: Dict[str, Any], key_prefix: str) -> None:
                 except Exception as e:
                     msg = str(e)
                     if "PGRST204" in msg and "t3_hit_time" in msg.lower():
-                        st.error("T3 richiede la migration Supabase V3.7. Se non usi T3, lascia disattivato Usa T3.")
+                        st.error("Per salvare T3 serve la migration Supabase V3.7. Se non vuoi usare T3, lascia semplicemente il campo T3 vuoto.")
                     else:
                         st.error(f"Registrazione trade non riuscita: {e}")
 
@@ -1992,6 +2198,7 @@ def page_new_signal() -> None:
         st.session_state["ocr_hash"] = file_hash
         st.session_state["ocr_data"] = None
         st.session_state["ocr_error"] = None
+        st.session_state["ocr_generation"] = 0
 
     img = Image.open(io.BytesIO(raw)).convert("RGB")
     st.image(img, caption=f"Anteprima · {uploaded.name}", use_container_width=True)
@@ -2001,11 +2208,25 @@ def page_new_signal() -> None:
             with st.spinner("Lettura OCR in corso..."):
                 full_text, top_text = run_ocr(img)
                 parsed = parse_signal(full_text, top_text)
-                # Nel nuovo template le X vengono lette direttamente dalla quarta colonna
-                # dell'immagine: è più affidabile dell'OCR della singola lettera X.
-                table_confirmations = extract_confirmations_from_table_image(img, full_text)
-                if table_confirmations is not None:
-                    parsed["confirmations"] = table_confirmations
+
+                # Nuovo motore dedicato alla tabella: la individua ovunque sia posizionata,
+                # legge righe/valori, X, RD e il box Timeframe adiacente.
+                table_data = extract_signal_table_data(img)
+                if table_data:
+                    for field in ("valid_date", "direction", "e1", "e2", "t1", "t2", "t3"):
+                        value = table_data.get(field)
+                        if value not in (None, ""):
+                            parsed[field] = value
+                    shared_stop = table_data.get("shared_stop")
+                    if shared_stop is not None:
+                        parsed["s1"] = shared_stop
+                        parsed["s2"] = shared_stop
+                    if table_data.get("setup_origin") not in (None, "", "—"):
+                        parsed["setup_origin"] = table_data["setup_origin"]
+                    if table_data.get("setup_timeframe") not in (None, "", "—"):
+                        parsed["setup_timeframe"] = table_data["setup_timeframe"]
+                    parsed["confirmations"] = list(table_data.get("confirmations") or [])
+
                 chart_levels = extract_chart_levels_from_lines(img)
                 for field in ("e1", "s1", "e2", "s2", "t1", "t2", "t3"):
                     if parsed.get(field) is None and chart_levels.get(field) is not None:
@@ -2015,8 +2236,12 @@ def page_new_signal() -> None:
                 st.session_state["ocr_data"] = {
                     **parsed, "full_text": full_text, "top_text": top_text,
                     "chart_levels": chart_levels,
+                    "table_data": table_data or {},
                 }
                 st.session_state["ocr_error"] = None
+                # Forza la ricreazione dei widget del form: altrimenti Streamlit conserva
+                # i vecchi valori (es. checkbox false) e non mostra le spunte lette dall'OCR.
+                st.session_state["ocr_generation"] = int(st.session_state.get("ocr_generation", 0)) + 1
         except Exception as e:
             st.session_state["ocr_error"] = str(e)
 
@@ -2028,44 +2253,35 @@ def page_new_signal() -> None:
         "valid_date": None, "instrument": "", "ticker": "", "direction": "",
         "e1": None, "s1": None, "e2": None, "s2": None, "t1": None, "t2": None, "t3": None,
         "setup_origin": "—", "setup_timeframe": "—", "confirmations": [],
-        "full_text": "", "top_text": "", "chart_levels": {},
+        "full_text": "", "top_text": "", "chart_levels": {}, "table_data": {},
     }
 
-    use_t3 = st.checkbox(
-        "Usa T3",
-        value=_numeric_or_none(ocr.get("t3")) is not None,
-        key=f"new_use_t3_{file_hash}",
-        help="Attivalo quando il segnale prevede un terzo target.",
-    )
+    form_generation = int(st.session_state.get("ocr_generation", 0))
+    form_suffix = f"{file_hash[:12]}_{form_generation}"
 
-    with st.form(f"signal_form_{file_hash[:12]}"):
+    with st.form(f"signal_form_{form_suffix}"):
         st.markdown("#### 1. Segnale originale")
         c1, c2, c3 = st.columns(3)
         default_date = date.fromisoformat(ocr["valid_date"]) if ocr.get("valid_date") else local_now().date()
-        valid_date = c1.date_input("Data di validità", value=default_date)
-        instrument = c2.text_input("Strumento", value=ocr.get("instrument", ""))
+        valid_date = c1.date_input("Data di validità", value=default_date, key=f"new_date_{form_suffix}")
+        instrument = c2.text_input("Strumento", value=ocr.get("instrument", ""), key=f"new_instrument_{form_suffix}")
         d_idx = 0 if ocr.get("direction") != "SHORT" else 1
-        direction = c3.selectbox("Direzione", ["LONG", "SHORT"], index=d_idx)
+        direction = c3.selectbox("Direzione", ["LONG", "SHORT"], index=d_idx, key=f"new_direction_{form_suffix}")
         ticker = st.text_input(
             "Ticker Yahoo Finance", value=ocr.get("ticker", ""),
             help="Esempio GOLD = GC=F, NASDAQ = NQ=F. Correggibile manualmente.",
+            key=f"new_ticker_{form_suffix}",
         )
 
         a1, a2, a3, a4 = st.columns(4)
-        e1 = normalize_number(a1.text_input("E1 indicativa", fmt_num(ocr.get("e1"))))
-        s1 = normalize_number(a2.text_input("S1 indicativo", fmt_num(ocr.get("s1"))))
-        e2 = normalize_number(a3.text_input("E2 indicativa", fmt_num(ocr.get("e2"))))
-        s2 = normalize_number(a4.text_input("S2 indicativo", fmt_num(ocr.get("s2"))))
-        if use_t3:
-            b1, b2, b3 = st.columns(3)
-            t1 = normalize_number(b1.text_input("T1", fmt_num(ocr.get("t1"))))
-            t2 = normalize_number(b2.text_input("T2", fmt_num(ocr.get("t2"))))
-            t3 = normalize_number(b3.text_input("T3", fmt_num(ocr.get("t3"))))
-        else:
-            b1, b2 = st.columns(2)
-            t1 = normalize_number(b1.text_input("T1", fmt_num(ocr.get("t1"))))
-            t2 = normalize_number(b2.text_input("T2", fmt_num(ocr.get("t2"))))
-            t3 = None
+        e1 = normalize_number(a1.text_input("E1 indicativa", fmt_num(ocr.get("e1")), key=f"new_e1_{form_suffix}"))
+        s1 = normalize_number(a2.text_input("S1 indicativo", fmt_num(ocr.get("s1")), key=f"new_s1_{form_suffix}"))
+        e2 = normalize_number(a3.text_input("E2 indicativa", fmt_num(ocr.get("e2")), key=f"new_e2_{form_suffix}"))
+        s2 = normalize_number(a4.text_input("S2 indicativo", fmt_num(ocr.get("s2")), key=f"new_s2_{form_suffix}"))
+        b1, b2, b3 = st.columns(3)
+        t1 = normalize_number(b1.text_input("T1", fmt_num(ocr.get("t1")), key=f"new_t1_{form_suffix}"))
+        t2 = normalize_number(b2.text_input("T2", fmt_num(ocr.get("t2")), key=f"new_t2_{form_suffix}"))
+        t3 = normalize_number(b3.text_input("T3", fmt_num(ocr.get("t3")), key=f"new_t3_{form_suffix}", help="Facoltativo. Se vuoto viene ignorato."))
 
         st.markdown("#### 2. Contesto del setup — facoltativo")
         c1, c2, c3 = st.columns(3)
@@ -2073,14 +2289,14 @@ def page_new_signal() -> None:
         origin_index = SETUP_ORIGINS.index(origin_default) if origin_default in SETUP_ORIGINS else 0
         setup_origin = c1.selectbox(
             "Origine del setup", SETUP_ORIGINS, index=origin_index,
-            key=f"new_origin_{file_hash[:12]}",
+            key=f"new_origin_{form_suffix}",
         )
-        reference_area = c2.text_input("Livello / area Balance o svolta", placeholder="es. 4365–4398")
+        reference_area = c2.text_input("Livello / area Balance o svolta", placeholder="es. 4365–4398", key=f"new_reference_{form_suffix}")
         tf_default = str(ocr.get("setup_timeframe") or "—")
         tf_index = TIMEFRAMES.index(tf_default) if tf_default in TIMEFRAMES else 0
         setup_tf = c3.selectbox(
             "Timeframe del riferimento", TIMEFRAMES, index=tf_index,
-            key=f"new_setup_tf_{file_hash[:12]}",
+            key=f"new_setup_tf_{form_suffix}",
         )
         st.markdown("**Conferme osservate — tutte facoltative**")
         cols = st.columns(4)
@@ -2090,14 +2306,15 @@ def page_new_signal() -> None:
             if cols[i % 4].checkbox(
                 name,
                 value=name in ocr_confirmations,
-                key=f"new_conf_{file_hash[:12]}_{i}",
+                key=f"new_conf_{form_suffix}_{i}",
             ):
                 confirmations.append(name)
-        notes = st.text_area("Note / motivazione del setup", placeholder="Scrivi solo se serve. Campo facoltativo.")
+        notes = st.text_area("Note / motivazione del setup", placeholder="Scrivi solo se serve. Campo facoltativo.", key=f"new_notes_{form_suffix}")
         distinct_signal = st.checkbox(
             "È un nuovo segnale distinto anche se esiste già lo stesso strumento/direzione nella stessa giornata",
             value=False,
             help="Lascia deselezionato normalmente. Serve solo quando la sala pubblica davvero più setup separati sullo stesso strumento nella stessa giornata.",
+            key=f"new_distinct_{form_suffix}",
         )
         submitted = st.form_submit_button("💾 Salva segnale", type="primary", use_container_width=True)
 
@@ -2150,7 +2367,7 @@ def page_new_signal() -> None:
                     "screenshot_path": screenshot_path,
                     "ocr_text": (ocr.get("top_text", "") + "\n" + ocr.get("full_text", "")).strip(),
                 }
-                if use_t3:
+                if t3 is not None:
                     payload["t3"] = t3
                 signal_id = insert_signal(payload)
             st.success(f"Segnale #{signal_id} salvato in modo persistente.")
@@ -2161,7 +2378,7 @@ def page_new_signal() -> None:
                 remove_screenshot(screenshot_path)
             msg = str(e)
             if "PGRST204" in msg and ("t3" in msg.lower() or "t3_hit_time" in msg.lower()):
-                st.error("T3 richiede la migration Supabase V3.7 (colonne t3 e t3_hit_time). Se non usi T3, lascia disattivato il flag Usa T3.")
+                st.error("Per salvare T3 serve la migration Supabase V3.7 (colonne t3 e t3_hit_time). Se non vuoi usare T3, lascia semplicemente il campo T3 vuoto.")
             else:
                 st.error(f"Salvataggio non riuscito: {e}")
 
@@ -2170,6 +2387,15 @@ def page_new_signal() -> None:
             if ocr.get("chart_levels"):
                 detected = " · ".join(f"{k.upper()} {fmt_num(v)}" for k, v in ocr["chart_levels"].items())
                 st.caption(f"Livelli letti direttamente dalle linee/scala destra: {detected}")
+            td = ocr.get("table_data") or {}
+            if td:
+                st.caption(
+                    "Tabella rilevata automaticamente · "
+                    f"X: {', '.join(td.get('checked_rows') or []) or 'nessuna'} · "
+                    f"TF: {td.get('setup_timeframe') or '—'}"
+                )
+                if td.get("table_text"):
+                    st.code(str(td.get("table_text")), language=None)
             st.code((ocr.get("top_text", "") + "\n---\n" + ocr.get("full_text", "")).strip())
 
 
