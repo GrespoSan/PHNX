@@ -21,7 +21,7 @@ import yfinance as yf
 from supabase import create_client, Client
 
 APP_NAME = "G. Signal Tracker"
-APP_VERSION = "V5.14"
+APP_VERSION = "V5.15"
 BUCKET_NAME = "signal-screenshots"
 LOCAL_TZ = ZoneInfo("Europe/Rome")
 
@@ -2861,7 +2861,10 @@ def format_yahoo_quote_age(value: Any, stale_after_min: float = 5.0) -> str:
     if age < 1:
         return "<1 min"
     mins = int(round(age))
-    return f"⚠️ {mins} min" if age > stale_after_min else f"{mins} min"
+    if age <= stale_after_min:
+        return f"{mins} min"
+    # Dashboard operativa: oltre 5 minuti basta sapere che il dato non è recente.
+    return "⚠️ NON RECENTE"
 
 
 def styled_signals_dataframe(df: pd.DataFrame, quotes: Optional[Dict[str, Dict[str, Any]]] = None):
