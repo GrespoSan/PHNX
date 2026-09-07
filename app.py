@@ -20,7 +20,7 @@ import yfinance as yf
 from supabase import create_client, Client
 
 APP_NAME = "G. Signal Tracker"
-APP_VERSION = "V5.3"
+APP_VERSION = "V5.4"
 BUCKET_NAME = "signal-screenshots"
 LOCAL_TZ = ZoneInfo("Europe/Rome")
 
@@ -2156,6 +2156,53 @@ def get_market_quote(
     return None, source, None
 
 
+
+def _value_decimal_places(value: Any) -> int:
+    """Numero di decimali significativi del valore così come arriva da DB/Yahoo."""
+    try:
+        if value is None or pd.isna(value):
+            return 0
+    except Exception:
+        pass
+    try:
+        d = Decimal(str(value))
+        if not d.is_finite():
+            return 0
+        exp = d.as_tuple().exponent
+        return max(0, -int(exp))
+    except (InvalidOperation, ValueError, TypeError):
+        return 0
+
+
+def market_price_decimals(row: Dict[str, Any], current_price: Optional[float] = None) -> int:
+    """Sceglie automaticamente la precisione utile per lo strumento.
+
+    Esempi:
+    - Treasury 107.8125 -> almeno 4 decimali
+    - FX 1.24075 -> 5 decimali
+    - Gold / indici -> normalmente 1-2 decimali
+    """
+    candidates = [
+        current_price,
+        row.get("e1"), row.get("e2"), row.get("s1"), row.get("s2"),
+        row.get("t1"), row.get("t2"), row.get("t3"),
+        row.get("actual_entry"), row.get("actual_stop"),
+    ]
+    precision = max((_value_decimal_places(v) for v in candidates), default=0)
+    # Evita una falsa precisione eccessiva, ma non tronca strumenti come FX/Treasury.
+    return max(1, min(5, precision))
+
+
+def format_market_price(row: Dict[str, Any], value: Optional[float]) -> str:
+    if value is None:
+        return "—"
+    try:
+        decimals = market_price_decimals(row, value)
+        return f"{float(value):.{decimals}f}"
+    except Exception:
+        return "—"
+
+
 def active_target_distance(row: Dict[str, Any], current_price: Optional[float]) -> Tuple[Optional[str], Optional[float], Optional[float]]:
     """Restituisce il prossimo target attivo (T1/T2/T3), distanza in punti e percentuale."""
     if current_price is None:
@@ -2195,7 +2242,9 @@ def format_target_distance(row: Dict[str, Any], current_price: Optional[float]) 
     label, points, pct = active_target_distance(row, current_price)
     if not label or points is None or pct is None:
         return "—"
-    return f"{label}: {float(points):.1f} pt · {pct:.2f}%"
+    decimals = market_price_decimals(row, current_price)
+    pct_decimals = 3 if decimals >= 4 else 2
+    return f"{label}: {float(points):.{decimals}f} pt · {pct:.{pct_decimals}f}%"
 
 
 def open_trade_status_label(row: Dict[str, Any]) -> str:
@@ -2474,7 +2523,7 @@ def styled_signals_dataframe(df: pd.DataFrame, quotes: Optional[Dict[str, float]
         price = quotes.get(ticker) if ticker else None
         if price is not None:
             # Il prezzo corrente è utile anche quando il segnale è ancora IDEA / IN ATTESA.
-            display.at[idx, "Prezzo attuale"] = f"{float(price):.1f}"
+            display.at[idx, "Prezzo attuale"] = format_market_price(raw, price)
             if status in {"IN TRADE", "T1 RAGGIUNTO", "T2 RAGGIUNTO"}:
                 display.at[idx, "Dist. target"] = format_target_distance(raw, price)
 
@@ -3338,7 +3387,7 @@ def dashboard_signal_detail(row: Dict[str, Any], quotes: Dict[str, float]) -> No
         pass
 
     m1, m2, m3 = st.columns(3)
-    m1.metric("Prezzo attuale", f"{float(price):.1f}" if price is not None else "—")
+    m1.metric("Prezzo attuale", format_market_price(row, price))
     m2.metric("Stato", state or "—")
     m3.metric("Esito", str(outcome) if outcome else "—")
 
