@@ -21,7 +21,7 @@ import yfinance as yf
 from supabase import create_client, Client
 
 APP_NAME = "G. Signal Tracker"
-APP_VERSION = "V5.12"
+APP_VERSION = "V5.13"
 BUCKET_NAME = "signal-screenshots"
 LOCAL_TZ = ZoneInfo("Europe/Rome")
 
@@ -2818,6 +2818,39 @@ def format_yahoo_quote_time(value: Any) -> str:
             return "—"
 
 
+def yahoo_quote_age_minutes(value: Any) -> Optional[float]:
+    if not value:
+        return None
+    try:
+        ts = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=LOCAL_TZ)
+        else:
+            ts = ts.astimezone(LOCAL_TZ)
+        age = (local_now() - ts).total_seconds() / 60.0
+        return max(0.0, age)
+    except Exception:
+        try:
+            ts = pd.to_datetime(value, utc=True, errors="coerce")
+            if pd.isna(ts):
+                return None
+            now_utc = pd.Timestamp.now(tz="UTC")
+            age = (now_utc - ts).total_seconds() / 60.0
+            return max(0.0, float(age))
+        except Exception:
+            return None
+
+
+def format_yahoo_quote_age(value: Any, stale_after_min: float = 5.0) -> str:
+    age = yahoo_quote_age_minutes(value)
+    if age is None:
+        return "—"
+    if age < 1:
+        return "<1 min"
+    mins = int(round(age))
+    return f"⚠️ {mins} min" if age > stale_after_min else f"{mins} min"
+
+
 def styled_signals_dataframe(df: pd.DataFrame, quotes: Optional[Dict[str, Dict[str, Any]]] = None):
     """Evidenzia livelli raggiunti e aggiunge prezzo/distanza del target attivo sulla stessa riga."""
     display = dataframe_for_display(df)
@@ -2827,6 +2860,7 @@ def styled_signals_dataframe(df: pd.DataFrame, quotes: Optional[Dict[str, Dict[s
     quotes = quotes or {}
     display["Prezzo attuale"] = "—"
     display["Ora Yahoo"] = "—"
+    display["Età dato"] = "—"
     display["TradingView"] = ""
     display["Dist. target"] = "—"
 
@@ -2872,17 +2906,18 @@ def styled_signals_dataframe(df: pd.DataFrame, quotes: Optional[Dict[str, Dict[s
             # Prezzo Yahoo + ora effettiva dell'ultimo dato restituito da Yahoo.
             display.at[idx, "Prezzo attuale"] = format_market_price(raw, price)
             display.at[idx, "Ora Yahoo"] = format_yahoo_quote_time(quote_time)
+            display.at[idx, "Età dato"] = format_yahoo_quote_age(quote_time)
             if status in {"IN TRADE", "T1 RAGGIUNTO", "T2 RAGGIUNTO"}:
                 display.at[idx, "Dist. target"] = format_target_distance(raw, price)
 
     # La distanza resta vicino allo Stato; prezzo attuale e collegamento TradingView
     # vengono messi alla fine, uno accanto all'altro.
     ordered = list(display.columns)
-    for col in ["Prezzo attuale", "Ora Yahoo", "TradingView", "Dist. target"]:
+    for col in ["Prezzo attuale", "Ora Yahoo", "Età dato", "TradingView", "Dist. target"]:
         ordered.remove(col)
     insert_at = ordered.index("Stato") if "Stato" in ordered else len(ordered)
     ordered.insert(insert_at, "Dist. target")
-    ordered.extend(["Prezzo attuale", "Ora Yahoo", "TradingView"])
+    ordered.extend(["Prezzo attuale", "Ora Yahoo", "Età dato", "TradingView"])
     display = display[ordered]
 
     def style_row(row: pd.Series) -> List[str]:
@@ -2899,8 +2934,13 @@ def styled_signals_dataframe(df: pd.DataFrame, quotes: Optional[Dict[str, Dict[s
             if col in row.index:
                 styles[row.index.get_loc(col)] = css
 
-        # L'ID è il punto di apertura del dettaglio: lo rendiamo visivamente riconoscibile.
-        set_style("ID", "color: #4da3ff; font-weight: 700;")
+        quote_info = quotes.get(effective_yahoo_ticker(raw)) if effective_yahoo_ticker(raw) else None
+        quote_time = quote_info.get("time") if isinstance(quote_info, dict) else None
+        quote_age = yahoo_quote_age_minutes(quote_time)
+        if quote_age is not None and quote_age > 5:
+            set_style("Età dato", "color: #f59e0b; font-weight: 700;")
+            set_style("Ora Yahoo", "color: #f59e0b; font-weight: 700;")
+            set_style("Prezzo attuale", "color: #f59e0b; font-weight: 700;")
 
         status = str(raw.get("status") or "")
         outcome = str(raw.get("outcome") or "")
@@ -3865,7 +3905,7 @@ def dashboard_live_panel(auto_monitor: bool) -> None:
     if auto_monitor and can_write():
         st.caption(
             f"🟢 Monitoraggio automatico attivo · controllo ogni 60 secondi · ultimo controllo: {last_market_check_label(df)}. "
-            "Fonte Yahoo Finance: il prezzo mostrato è l’ultimo dato disponibile e può essere ritardato. I segnali chiusi non vengono aggiornati."
+            "Fonte Yahoo Finance: se Età dato supera 5 minuti il prezzo viene evidenziato in arancione e non deve essere considerato recente. I segnali chiusi non vengono aggiornati."
         )
     else:
         st.caption(f"Ultimo controllo mercato: {last_market_check_label(df)}")
@@ -3884,11 +3924,9 @@ def dashboard_live_panel(auto_monitor: bool) -> None:
         on_select="rerun",
         selection_mode="single-row",
         column_config={
-            "ID": st.column_config.NumberColumn(
-                "ID",
-                help="Seleziona il quadratino a sinistra per aprire il dettaglio completo sotto la tabella",
-                width="small",
-            ),
+            "ID": None,
+            "Ora Yahoo": st.column_config.TextColumn("Ora Yahoo", width="small"),
+            "Età dato": st.column_config.TextColumn("Età dato", width="small"),
             "TradingView": st.column_config.LinkColumn(
                 "TV",
                 help="Apri direttamente il grafico dello strumento su TradingView",
