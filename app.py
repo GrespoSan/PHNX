@@ -21,7 +21,7 @@ import yfinance as yf
 from supabase import create_client, Client
 
 APP_NAME = "G. Signal Tracker"
-APP_VERSION = "V5.8"
+APP_VERSION = "V5.9"
 BUCKET_NAME = "signal-screenshots"
 LOCAL_TZ = ZoneInfo("Europe/Rome")
 
@@ -1860,6 +1860,12 @@ def _edit_signal_body(row: Dict[str, Any], key_prefix: str) -> None:
             )
             if checked:
                 confirmations_edit.append(name)
+        telegram_alert_edit = st.checkbox(
+            "🔔 Pre-allarme Telegram E1/E2",
+            value=bool(row.get("telegram_alert_enabled", True)),
+            help="Invia un solo pre-allarme per E1 e uno per E2 quando il prezzo entra entro il 15% dell'ATR(5) Daily dal livello, prima di raggiungerlo.",
+            key=f"{key_prefix}_telegram_alert_{sid}",
+        )
         notes_edit = st.text_area(
             "Note / motivazione del setup", value=str(row.get("notes") or ""),
             key=f"{key_prefix}_notes_{sid}",
@@ -1890,6 +1896,7 @@ def _edit_signal_body(row: Dict[str, Any], key_prefix: str) -> None:
             "reference_area": reference_area_edit.strip(),
             "setup_timeframe": setup_tf_edit,
             "confirmations": confirmations_edit,
+            "telegram_alert_enabled": telegram_alert_edit,
             "notes": notes_edit.strip(),
         }
         # T3 è facoltativo: se non compilato viene ignorato. Se esisteva già, può essere svuotato.
@@ -1920,6 +1927,18 @@ def _edit_signal_body(row: Dict[str, Any], key_prefix: str) -> None:
             updates["signal_t2_hit_time"] = None
             updates["signal_t3_hit_time"] = None
 
+        telegram_levels_changed = (
+            _num_changed(row.get("e1"), e1_edit)
+            or _num_changed(row.get("e2"), e2_edit)
+            or str(row.get("direction") or "") != direction_edit
+            or not _same_instant(old_signal_start, signal_start_dt_edit.isoformat())
+        )
+        if telegram_levels_changed:
+            updates["telegram_e1_alert_status"] = "PENDING"
+            updates["telegram_e1_alert_sent_at"] = None
+            updates["telegram_e2_alert_status"] = "PENDING"
+            updates["telegram_e2_alert_sent_at"] = None
+
         if monitoring_changed:
             updates.update({
                 "status": "IN TRADE",
@@ -1948,7 +1967,9 @@ def _edit_signal_body(row: Dict[str, Any], key_prefix: str) -> None:
             st.rerun()
         except Exception as e:
             msg = str(e)
-            if "PGRST204" in msg and ("t3" in msg.lower() or "t3_hit_time" in msg.lower()):
+            if "PGRST204" in msg and "telegram_" in msg.lower():
+                st.error("Mancano le colonne Telegram. Esegui la migration V5.9 una sola volta e riprova.")
+            elif "PGRST204" in msg and ("t3" in msg.lower() or "t3_hit_time" in msg.lower()):
                 st.error("Per salvare T3 serve la migration Supabase V3.7 (colonne t3 e t3_hit_time). Se non vuoi usare T3, lascia semplicemente il campo T3 vuoto.")
             else:
                 st.error(f"Modifica non riuscita: {e}")
@@ -3379,6 +3400,12 @@ def page_new_signal() -> None:
                 key=f"new_conf_{form_suffix}_{i}",
             ):
                 confirmations.append(name)
+        telegram_alert_enabled = st.checkbox(
+            "🔔 Pre-allarme Telegram E1/E2",
+            value=True,
+            help="Default ON. Un solo avviso per E1 e uno per E2 quando la distanza è ≤ 15% ATR(5) Daily.",
+            key=f"new_telegram_alert_{form_suffix}",
+        )
         notes = st.text_area("Note / motivazione del setup", placeholder="Scrivi solo se serve. Campo facoltativo.", key=f"new_notes_{form_suffix}")
         distinct_signal = st.checkbox(
             "È un nuovo segnale distinto anche se esiste già lo stesso strumento/direzione nella stessa giornata",
@@ -3435,6 +3462,9 @@ def page_new_signal() -> None:
                     "reference_area": reference_area.strip(),
                     "setup_timeframe": setup_tf,
                     "confirmations": confirmations,
+                    "telegram_alert_enabled": telegram_alert_enabled,
+                    "telegram_e1_alert_status": "PENDING",
+                    "telegram_e2_alert_status": "PENDING",
                     "notes": notes.strip(),
                     "screenshot_path": screenshot_path,
                     "ocr_text": (ocr.get("top_text", "") + "\n" + ocr.get("full_text", "")).strip(),
@@ -3449,7 +3479,9 @@ def page_new_signal() -> None:
             if screenshot_path:
                 remove_screenshot(screenshot_path)
             msg = str(e)
-            if "PGRST204" in msg and "signal_start_time" in msg.lower():
+            if "PGRST204" in msg and "telegram_" in msg.lower():
+                st.error("Mancano le colonne Telegram. Esegui la migration V5.9 una sola volta e riprova.")
+            elif "PGRST204" in msg and "signal_start_time" in msg.lower():
                 st.error("Manca la colonna Supabase signal_start_time. Esegui la migration V5.8 una sola volta e riprova.")
             elif "PGRST204" in msg and ("t3" in msg.lower() or "t3_hit_time" in msg.lower()):
                 st.error("Per salvare T3 serve la migration Supabase V3.7 (colonne t3 e t3_hit_time). Se non vuoi usare T3, lascia semplicemente il campo T3 vuoto.")
@@ -3697,6 +3729,11 @@ def dashboard_signal_detail(row: Dict[str, Any], quotes: Dict[str, float]) -> No
     tv_url = tradingview_chart_url(row)
     if tv_url:
         st.link_button("📊 Apri TradingView", tv_url, use_container_width=False)
+
+    if bool(row.get("telegram_alert_enabled", False)):
+        e1_state = str(row.get("telegram_e1_alert_status") or "PENDING")
+        e2_state = str(row.get("telegram_e2_alert_status") or "PENDING")
+        st.caption(f"🔔 Telegram · E1: {e1_state} · E2: {e2_state} · soglia 15% ATR(5) Daily")
 
     if can_write():
         render_saved_signal_actions(row, key_prefix=f"dashboard_detail_{sid}")
