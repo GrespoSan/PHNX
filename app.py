@@ -21,7 +21,7 @@ import yfinance as yf
 from supabase import create_client, Client
 
 APP_NAME = "G. Signal Tracker"
-APP_VERSION = "V5.9"
+APP_VERSION = "V5.10"
 BUCKET_NAME = "signal-screenshots"
 LOCAL_TZ = ZoneInfo("Europe/Rome")
 
@@ -3297,41 +3297,56 @@ def page_new_signal() -> None:
         st.error("Il tuo profilo è in sola lettura.")
         return
     st.subheader("Carica nuovo segnale")
-    st.caption("Carica lo screenshot; l'OCR legge esclusivamente la tabella standard 10x4. Origine e Timeframe restano manuali.")
+    st.caption("Puoi caricare uno screenshot e usare l'OCR, oppure inserire il segnale completamente a mano senza immagine.")
 
-    uploaded = st.file_uploader("Carica screenshot Telegram / TradingView", type=["png", "jpg", "jpeg", "webp"])
-    if not uploaded:
-        st.info("Carica uno screenshot per iniziare.")
-        return
+    manual_only = st.checkbox(
+        "✍️ Inserisci segnale senza screenshot",
+        value=False,
+        help="Usalo quando non hai un'immagine. Tutti i dati verranno compilati manualmente.",
+        key="new_signal_manual_only",
+    )
 
-    raw = uploaded.getvalue()
-    file_hash = hashlib.sha1(raw).hexdigest()
-    if st.session_state.get("ocr_hash") != file_hash:
-        st.session_state["ocr_hash"] = file_hash
+    uploaded = None
+    img = None
+    if not manual_only:
+        uploaded = st.file_uploader("Carica screenshot Telegram / TradingView", type=["png", "jpg", "jpeg", "webp"])
+        if not uploaded:
+            st.info("Carica uno screenshot oppure seleziona “Inserisci segnale senza screenshot”.")
+            return
+
+        raw = uploaded.getvalue()
+        file_hash = hashlib.sha1(raw).hexdigest()
+        if st.session_state.get("ocr_hash") != file_hash:
+            st.session_state["ocr_hash"] = file_hash
+            st.session_state["ocr_data"] = None
+            st.session_state["ocr_error"] = None
+            st.session_state["ocr_generation"] = 0
+
+        img = Image.open(io.BytesIO(raw)).convert("RGB")
+        st.image(img, caption=f"Anteprima · {uploaded.name}", use_container_width=True)
+
+        if st.button("🔎 Leggi screenshot", type="primary"):
+            try:
+                with st.spinner("Lettura OCR in corso..."):
+                    ocr_payload = extract_signal_payload_from_image(img)
+                    # Prima di mostrare i nuovi valori OCR eliminiamo gli eventuali valori
+                    # vecchi dei widget. Questo evita casi in cui E1 o una conferma restano
+                    # quelli della lettura precedente nonostante l'OCR attuale sia corretto.
+                    _reset_new_signal_widget_state()
+                    st.session_state["ocr_data"] = ocr_payload
+                    st.session_state["ocr_error"] = None
+                    st.session_state["ocr_generation"] = int(st.session_state.get("ocr_generation", 0)) + 1
+            except Exception as e:
+                st.session_state["ocr_error"] = str(e)
+
+        if st.session_state.get("ocr_error"):
+            st.error(st.session_state["ocr_error"])
+            st.caption("Puoi comunque proseguire inserendo i dati manualmente.")
+    else:
+        file_hash = "manual"
+        # In modalità manuale non riutilizziamo dati OCR di uno screenshot precedente.
         st.session_state["ocr_data"] = None
         st.session_state["ocr_error"] = None
-        st.session_state["ocr_generation"] = 0
-
-    img = Image.open(io.BytesIO(raw)).convert("RGB")
-    st.image(img, caption=f"Anteprima · {uploaded.name}", use_container_width=True)
-
-    if st.button("🔎 Leggi screenshot", type="primary"):
-        try:
-            with st.spinner("Lettura OCR in corso..."):
-                ocr_payload = extract_signal_payload_from_image(img)
-                # Prima di mostrare i nuovi valori OCR eliminiamo gli eventuali valori
-                # vecchi dei widget. Questo evita casi in cui E1 o una conferma restano
-                # quelli della lettura precedente nonostante l'OCR attuale sia corretto.
-                _reset_new_signal_widget_state()
-                st.session_state["ocr_data"] = ocr_payload
-                st.session_state["ocr_error"] = None
-                st.session_state["ocr_generation"] = int(st.session_state.get("ocr_generation", 0)) + 1
-        except Exception as e:
-            st.session_state["ocr_error"] = str(e)
-
-    if st.session_state.get("ocr_error"):
-        st.error(st.session_state["ocr_error"])
-        st.caption("Puoi comunque proseguire inserendo i dati manualmente.")
 
     ocr = st.session_state.get("ocr_data") or {
         "valid_date": None, "instrument": "", "ticker": "", "direction": "",
@@ -3449,7 +3464,8 @@ def page_new_signal() -> None:
         screenshot_path = ""
         try:
             with st.spinner("Salvataggio permanente in corso..."):
-                screenshot_path = upload_screenshot(uploaded)
+                if uploaded is not None:
+                    screenshot_path = upload_screenshot(uploaded)
                 signal_start_dt = _combine_signal_datetime(valid_date, signal_time)
                 payload = {
                     "valid_date": valid_date.isoformat(),
