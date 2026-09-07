@@ -21,7 +21,7 @@ import yfinance as yf
 from supabase import create_client, Client
 
 APP_NAME = "G. Signal Tracker"
-APP_VERSION = "V5.7"
+APP_VERSION = "V5.8"
 BUCKET_NAME = "signal-screenshots"
 LOCAL_TZ = ZoneInfo("Europe/Rome")
 
@@ -1723,6 +1723,33 @@ def _option_index(options: List[str], value: Any, default: int = 0) -> int:
         return default
 
 
+
+def _combine_signal_datetime(signal_date: date, signal_time_value: Any) -> datetime:
+    """Combina Data/Ora del segnale come ora locale italiana, pronta per Supabase."""
+    hour = int(getattr(signal_time_value, "hour", 0))
+    minute = int(getattr(signal_time_value, "minute", 0))
+    second = int(getattr(signal_time_value, "second", 0))
+    return datetime(
+        signal_date.year, signal_date.month, signal_date.day,
+        hour, minute, second, tzinfo=LOCAL_TZ
+    )
+
+
+def _signal_monitor_start_local(row: Dict[str, Any]) -> datetime:
+    """Data/Ora del segnale; per i record vecchi usa created_at come fallback."""
+    value = row.get("signal_start_time") or row.get("created_at")
+    return _local_datetime_from_db(value)
+
+
+def _same_instant(a: Any, b: Any) -> bool:
+    try:
+        da = _local_datetime_from_db(a)
+        db = _local_datetime_from_db(b)
+        return abs((da - db).total_seconds()) < 1
+    except Exception:
+        return str(a or "") == str(b or "")
+
+
 def _local_datetime_from_db(value: Any) -> datetime:
     """Converte un timestamp Supabase in Europe/Rome per i campi di modifica."""
     if not value:
@@ -1771,16 +1798,24 @@ def _edit_signal_body(row: Dict[str, Any], key_prefix: str) -> None:
     # il setup senza dover dichiarare prematuramente un trade reale.
     # ------------------------------------------------------------------
     with st.form(f"{key_prefix}_edit_signal_{sid}"):
-        c1, c2, c3 = st.columns(3)
+        c1, c2, c3, c4 = st.columns(4)
         try:
             current_date = date.fromisoformat(str(row.get("valid_date")))
         except Exception:
             current_date = local_now().date()
-        valid_date_edit = c1.date_input("Data di validità", value=current_date, key=f"{key_prefix}_date_{sid}")
-        instrument_edit = c2.text_input(
+        current_signal_dt = _signal_monitor_start_local(row)
+        valid_date_edit = c1.date_input("Data del segnale", value=current_date, key=f"{key_prefix}_date_{sid}")
+        signal_time_edit = c2.time_input(
+            "Ora del segnale",
+            value=current_signal_dt.time().replace(microsecond=0),
+            step=60,
+            help="Ora originale di pubblicazione del segnale. Serve per verificare T1/T2/T3 solo da quel momento in avanti.",
+            key=f"{key_prefix}_signal_time_{sid}",
+        )
+        instrument_edit = c3.text_input(
             "Strumento", value=canonical_instrument_label(row.get("instrument")), key=f"{key_prefix}_instr_{sid}"
         )
-        direction_edit = c3.selectbox(
+        direction_edit = c4.selectbox(
             "Direzione", ["LONG", "SHORT"],
             index=_option_index(["LONG", "SHORT"], row.get("direction")),
             key=f"{key_prefix}_dir_{sid}",
@@ -1842,8 +1877,10 @@ def _edit_signal_body(row: Dict[str, Any], key_prefix: str) -> None:
             st.error("Campi necessari mancanti o non validi: " + ", ".join(errors))
             return
 
+        signal_start_dt_edit = _combine_signal_datetime(valid_date_edit, signal_time_edit)
         updates: Dict[str, Any] = {
             "valid_date": valid_date_edit.isoformat(),
+            "signal_start_time": signal_start_dt_edit.isoformat(),
             "instrument": instrument_edit.strip(),
             "ticker": ticker_edit.strip(),
             "direction": direction_edit,
@@ -1870,11 +1907,13 @@ def _edit_signal_body(row: Dict[str, Any], key_prefix: str) -> None:
                 or str(row.get("direction") or "") != direction_edit
                 or str(row.get("ticker") or "").strip() != ticker_edit.strip()
             )
+        old_signal_start = row.get("signal_start_time") or row.get("created_at")
         signal_targets_changed = (
             _num_changed(row.get("t1"), t1_edit)
             or _num_changed(row.get("t2"), t2_edit)
             or _num_changed(row.get("t3"), t3_edit)
             or str(row.get("direction") or "") != direction_edit
+            or not _same_instant(old_signal_start, signal_start_dt_edit.isoformat())
         )
         if signal_targets_changed:
             updates["signal_t1_hit_time"] = None
@@ -2459,8 +2498,12 @@ def _timestamp_present(value: Any) -> bool:
 
 
 def _signal_created_datetime(row: Dict[str, Any]) -> Optional[datetime]:
-    """Istante da cui un target può essere considerato raggiunto: salvataggio in piattaforma."""
-    value = row.get("created_at")
+    """Istante da cui un target può essere considerato raggiunto.
+
+    V5.8: usa Data/Ora originale del segnale quando presente.
+    Per i vecchi record continua a usare created_at come fallback.
+    """
+    value = row.get("signal_start_time") or row.get("created_at")
     if not value:
         return None
     try:
@@ -3281,12 +3324,19 @@ def page_new_signal() -> None:
 
     with st.form(f"signal_form_{form_suffix}"):
         st.markdown("#### 1. Segnale originale")
-        c1, c2, c3 = st.columns(3)
+        c1, c2, c3, c4 = st.columns(4)
         default_date = date.fromisoformat(ocr["valid_date"]) if ocr.get("valid_date") else local_now().date()
-        valid_date = c1.date_input("Data di validità", value=default_date, key=f"new_date_{form_suffix}")
-        instrument = c2.text_input("Strumento", value=ocr.get("instrument", ""), key=f"new_instrument_{form_suffix}")
+        valid_date = c1.date_input("Data del segnale", value=default_date, key=f"new_date_{form_suffix}")
+        signal_time = c2.time_input(
+            "Ora del segnale",
+            value=local_now().time().replace(second=0, microsecond=0),
+            step=60,
+            help="Se stai caricando una scheda arretrata, imposta l'ora originale di pubblicazione. Il controllo T1/T2/T3 partirà da qui.",
+            key=f"new_signal_time_{form_suffix}",
+        )
+        instrument = c3.text_input("Strumento", value=ocr.get("instrument", ""), key=f"new_instrument_{form_suffix}")
         d_idx = 0 if ocr.get("direction") != "SHORT" else 1
-        direction = c3.selectbox("Direzione", ["LONG", "SHORT"], index=d_idx, key=f"new_direction_{form_suffix}")
+        direction = c4.selectbox("Direzione", ["LONG", "SHORT"], index=d_idx, key=f"new_direction_{form_suffix}")
         ticker = st.text_input(
             "Ticker Yahoo Finance", value=ocr.get("ticker", ""),
             help="Esempio GOLD = GC=F, NASDAQ = NQ=F. Correggibile manualmente.",
@@ -3373,8 +3423,10 @@ def page_new_signal() -> None:
         try:
             with st.spinner("Salvataggio permanente in corso..."):
                 screenshot_path = upload_screenshot(uploaded)
+                signal_start_dt = _combine_signal_datetime(valid_date, signal_time)
                 payload = {
                     "valid_date": valid_date.isoformat(),
+                    "signal_start_time": signal_start_dt.isoformat(),
                     "instrument": instrument.strip(),
                     "ticker": ticker.strip(),
                     "direction": direction,
@@ -3397,7 +3449,9 @@ def page_new_signal() -> None:
             if screenshot_path:
                 remove_screenshot(screenshot_path)
             msg = str(e)
-            if "PGRST204" in msg and ("t3" in msg.lower() or "t3_hit_time" in msg.lower()):
+            if "PGRST204" in msg and "signal_start_time" in msg.lower():
+                st.error("Manca la colonna Supabase signal_start_time. Esegui la migration V5.8 una sola volta e riprova.")
+            elif "PGRST204" in msg and ("t3" in msg.lower() or "t3_hit_time" in msg.lower()):
                 st.error("Per salvare T3 serve la migration Supabase V3.7 (colonne t3 e t3_hit_time). Se non vuoi usare T3, lascia semplicemente il campo T3 vuoto.")
             else:
                 st.error(f"Salvataggio non riuscito: {e}")
@@ -3595,7 +3649,11 @@ def dashboard_signal_detail(row: Dict[str, Any], quotes: Dict[str, float]) -> No
     st.divider()
     st.markdown(f"## #{sid} · {instrument} · {direction}")
     if valid_date:
-        st.caption(f"Data segnale: {valid_date}")
+        monitor_start = _signal_monitor_start_local(row)
+        st.caption(
+            f"Data segnale: {valid_date} · Monitoraggio target dal: "
+            f"{monitor_start.strftime('%d/%m/%Y %H:%M')}"
+        )
 
     original_path = _optional_path(row.get("screenshot_path"))
     final_path = _optional_path(row.get("final_screenshot_path"))
