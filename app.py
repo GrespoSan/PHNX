@@ -20,7 +20,7 @@ import yfinance as yf
 from supabase import create_client, Client
 
 APP_NAME = "G. Signal Tracker"
-APP_VERSION = "V5.2"
+APP_VERSION = "V5.3"
 BUCKET_NAME = "signal-screenshots"
 LOCAL_TZ = ZoneInfo("Europe/Rome")
 
@@ -2105,7 +2105,7 @@ def _store_market_quote(ticker: str, price: Optional[float], quote_time: Any = N
     quotes[str(ticker)] = {"price": value, "time": ts, "source": source}
 
 
-def _recent_market_quote(ticker: str, max_age_seconds: int = 120) -> Optional[Dict[str, Any]]:
+def _recent_market_quote(ticker: str, max_age_seconds: int = 45) -> Optional[Dict[str, Any]]:
     if not ticker:
         return None
     item = (st.session_state.get("market_quotes") or {}).get(str(ticker))
@@ -2124,13 +2124,30 @@ def _recent_market_quote(ticker: str, max_age_seconds: int = 120) -> Optional[Di
     return item
 
 
-def get_market_quote(ticker: str, allow_fetch: bool = True) -> Tuple[Optional[float], str, Optional[str]]:
-    """Prezzo corrente con riuso del dato già acquisito dal monitoraggio."""
-    recent = _recent_market_quote(ticker)
-    if recent:
-        return float(recent["price"]), str(recent.get("source") or "Yahoo Finance"), str(recent.get("time") or "")
+def get_market_quote(
+    ticker: str,
+    allow_fetch: bool = True,
+    force_refresh: bool = False,
+) -> Tuple[Optional[float], str, Optional[str]]:
+    """Prezzo corrente con riuso del dato recente.
+
+    force_refresh=True viene usato dal pulsante Aggiorna ora:
+    elimina il riuso della sessione e forza una nuova richiesta Yahoo.
+    """
+    if not force_refresh:
+        recent = _recent_market_quote(ticker)
+        if recent:
+            return float(recent["price"]), str(recent.get("source") or "Yahoo Finance"), str(recent.get("time") or "")
+
     if not allow_fetch:
         return None, "", None
+
+    if force_refresh:
+        try:
+            get_current_price.clear()
+        except Exception:
+            pass
+
     price, source = get_current_price(ticker)
     if price is not None:
         _store_market_quote(ticker, price, local_now(), source)
@@ -2522,8 +2539,12 @@ def styled_signals_dataframe(df: pd.DataFrame, quotes: Optional[Dict[str, float]
     return display.style.apply(style_row, axis=1)
 
 
-def dashboard_quotes(df: pd.DataFrame, allow_fetch: bool) -> Dict[str, float]:
-    """Prezzi per tutti i segnali ancora attivi: idea, trade aperto e T1 già raggiunto."""
+def dashboard_quotes(
+    df: pd.DataFrame,
+    allow_fetch: bool,
+    force_refresh: bool = False,
+) -> Dict[str, float]:
+    """Prezzi per tutti i segnali ancora attivi: idea e trade aperti."""
     quotes: Dict[str, float] = {}
     if df.empty:
         return quotes
@@ -2539,7 +2560,7 @@ def dashboard_quotes(df: pd.DataFrame, allow_fetch: bool) -> Dict[str, float]:
             tickers.append(ticker)
 
     for ticker in tickers:
-        price, _, _ = get_market_quote(ticker, allow_fetch=allow_fetch)
+        price, _, _ = get_market_quote(ticker, allow_fetch=allow_fetch, force_refresh=force_refresh)
         if price is not None:
             quotes[ticker] = float(price)
     return quotes
@@ -3367,7 +3388,7 @@ def dashboard_live_panel(auto_monitor: bool) -> None:
     if auto_monitor and can_write():
         st.caption(
             f"🟢 Monitoraggio automatico attivo · controllo ogni 60 secondi · ultimo controllo: {last_market_check_label(df)}. "
-            "Fonte Yahoo Finance: il prezzo mostrato è l’ultimo dato disponibile e può essere ritardato."
+            "Fonte Yahoo Finance: il prezzo mostrato è l’ultimo dato disponibile e può essere ritardato. I segnali chiusi non vengono aggiornati."
         )
     else:
         st.caption(f"Ultimo controllo mercato: {last_market_check_label(df)}")
@@ -3377,7 +3398,7 @@ def dashboard_live_panel(auto_monitor: bool) -> None:
     if notes:
         st.warning("\n".join(notes))
 
-    quotes = dashboard_quotes(df, allow_fetch=True)
+    quotes = dashboard_quotes(df, allow_fetch=True, force_refresh=manual_update)
     table_event = st.dataframe(
         styled_signals_dataframe(df, quotes),
         use_container_width=True,
