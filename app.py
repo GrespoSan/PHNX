@@ -20,7 +20,7 @@ import yfinance as yf
 from supabase import create_client, Client
 
 APP_NAME = "G. Signal Tracker"
-APP_VERSION = "V4.9"
+APP_VERSION = "V5.0"
 BUCKET_NAME = "signal-screenshots"
 LOCAL_TZ = ZoneInfo("Europe/Rome")
 
@@ -1262,86 +1262,87 @@ def _ocr_table_code_cell(img: Image.Image, bbox: Tuple[int, int, int, int], row_
     return _normalize_confirmation_code_token(raw)
 
 
-def _table_x_is_checked(img: Image.Image, bbox: Tuple[int, int, int, int], row_idx: int) -> bool:
-    """Rileva la X nella quarta colonna della singola riga con OCR dedicato."""
-    box = _table_cell_box(bbox, row_idx, 3, pad_x=1, pad_y=1)
-    crop = ImageOps.grayscale(img.crop(box))
+def _ocr_ok_marker(crop: Image.Image) -> bool:
+    """Riconosce esclusivamente la parola OK nella cella di attivazione.
+
+    Non usa più la quantità di pixel scuri: bordi e griglia non possono quindi
+    attivare falsamente una conferma. Sono tollerati piccoli errori OCR come 0K.
+    """
+    crop = ImageOps.grayscale(crop)
     if crop.width <= 1 or crop.height <= 1:
         return False
-    crop = crop.resize((crop.width * 8, crop.height * 8))
+    crop = crop.resize((max(1, crop.width * 8), max(1, crop.height * 8)), Image.Resampling.LANCZOS)
     crop = ImageEnhance.Contrast(crop).enhance(3.0)
     arr = np.array(crop)
-    bw = Image.fromarray(np.where(arr < 175, 0, 255).astype("uint8"))
-    try:
-        raw = pytesseract.image_to_string(
-            bw, config="--psm 10 -c tessedit_char_whitelist=Xx"
-        ).strip()
-    except Exception:
-        raw = ""
-    return "X" in raw.upper()
+
+    for threshold in (150, 175, 195, 215):
+        bw = Image.fromarray(np.where(arr < threshold, 0, 255).astype("uint8"))
+        for psm in (7, 10, 13):
+            try:
+                raw = pytesseract.image_to_string(
+                    bw,
+                    config=f"--psm {psm} -c tessedit_char_whitelist=OKok0",
+                ).strip().upper()
+            except Exception:
+                raw = ""
+            token = re.sub(r"[^A-Z0-9]", "", raw).replace("0", "O")
+            if token == "OK" or token.startswith("OK"):
+                return True
+    return False
+
+
+def _table_ok_is_checked(img: Image.Image, bbox: Tuple[int, int, int, int], row_idx: int) -> bool:
+    """Legge la cella OK nella quarta colonna della riga del formato completo."""
+    box = _table_cell_box(bbox, row_idx, 3, pad_x=0, pad_y=1)
+    return _ocr_ok_marker(img.crop(box))
 
 
 def _checked_rows_from_table_bbox(img: Image.Image, bbox: Tuple[int, int, int, int]) -> List[str]:
-    """Rileva le X nella quarta colonna usando il bbox reale della tabella."""
-    arr = np.array(img.convert("RGB"))
-    x_left, y_top, x_right, y_bottom = bbox
+    """Compatibilità: restituisce le righe del formato completo con cella OK."""
     row_labels = ["HEADER", "E1", "E2", "T1", "T2", "T3", "STOP"]
-    # La colonna X è l'ultima e molto stretta. Prendiamo circa l'ultimo 13% del
-    # bbox reale della tabella: abbastanza largo per piccole variazioni di scala,
-    # ma senza invadere la colonna delle sigle conferma.
-    x0 = int(x_left + (x_right - x_left) * 0.87)
-    x1 = max(x0 + 2, x_right - 2)
-    checked: List[str] = []
-    for r, label in enumerate(row_labels):
-        yy0 = int(y_top + r * (y_bottom - y_top) / len(row_labels)) + 3
-        yy1 = int(y_top + (r + 1) * (y_bottom - y_top) / len(row_labels)) - 3
-        if yy1 <= yy0:
-            continue
-        cell = arr[yy0:yy1, x0:x1]
-        if cell.size == 0:
-            continue
-        rr, gg, bb = cell[:, :, 0], cell[:, :, 1], cell[:, :, 2]
-        dark_neutral = (rr < 145) & (gg < 145) & (bb < 145)
-        if label != "HEADER" and int(dark_neutral.sum()) >= 8:
-            checked.append(label)
-    return checked
+    return [
+        label for idx, label in enumerate(row_labels)
+        if label != "HEADER" and _table_ok_is_checked(img, bbox, idx)
+    ]
 
 
 def _compact_table_confirmations(img: Image.Image, bbox: Tuple[int, int, int, int]) -> Tuple[List[str], List[str]]:
-    """Legge le X nel formato compatto: RD + sei conferme, senza colonna valori."""
+    """Legge il formato compatto usando la parola OK nell'ultima colonna.
+
+    Regola definitiva: una conferma viene attivata SOLO se nella relativa cella
+    viene riconosciuto il testo OK. Bordi, griglia o celle vuote non contano.
+    """
     x0, y0, x1, y1 = bbox
-    w = max(1, x1 - x0); h = max(1, y1 - y0)
+    w = max(1, x1 - x0)
+    h = max(1, y1 - y0)
     row_codes = ["RD", "STOC/TDI", "MM", "M4", "ST", "DIV", "FIBO"]
     confirmations: List[str] = []
     checked_rows: List[str] = []
+
     for row_idx, code in enumerate(row_codes):
-        if row_idx == 0:
-            continue
-        yy0 = int(y0 + row_idx * h / 7.0) + 2
-        yy1 = int(y0 + (row_idx + 1) * h / 7.0) - 2
-        xx0 = int(x0 + w * 0.80) + 1
+        # L'ultima colonna del template compatto è circa l'ultimo 22% della tabella.
+        yy0 = int(y0 + row_idx * h / 7.0) + 1
+        yy1 = int(y0 + (row_idx + 1) * h / 7.0) - 1
+        xx0 = int(x0 + w * 0.78)
         xx1 = x1 - 1
         if yy1 <= yy0 or xx1 <= xx0:
             continue
-        cell = np.array(ImageOps.grayscale(img.crop((xx0, yy0, xx1, yy1))))
-        if cell.size == 0:
+        if not _ocr_ok_marker(img.crop((xx0, yy0, xx1, yy1))):
             continue
-        # La X è scura; la griglia/fondo restano molto più chiari. Soglia testata
-        # anche sull'immagine NQ con tabella compatta.
-        dark = int((cell < 180).sum())
-        if dark >= max(4, int(cell.size * 0.012)):
-            checked_rows.append(code)
-            label = CONFIRMATION_CODE_MAP.get(code)
-            if label and label not in confirmations:
-                confirmations.append(label)
+
+        checked_rows.append(code)
+        label = CONFIRMATION_CODE_MAP.get(code)
+        if label and label not in confirmations:
+            confirmations.append(label)
+
     return confirmations, checked_rows
 
 
 def extract_signal_table_data(img: Image.Image) -> Optional[Dict[str, Any]]:
     """Estrae automaticamente entrambi i formati tabella usati negli screenshot.
 
-    - FULL: LONG/SHORT + data + RD, valori E1/E2/T1/T2/T3/Stop, conferme e X.
-    - COMPACT: RD + elenco conferme/X; i prezzi vengono letti dalle linee a destra.
+    - FULL: LONG/SHORT + data + RD, valori E1/E2/T1/T2/T3/Stop, conferme e OK.
+    - COMPACT: RD + elenco conferme/OK; i prezzi vengono letti dalle linee a destra.
     """
     bbox = _detect_signal_table_bbox(img)
     if not bbox:
@@ -1410,7 +1411,7 @@ def extract_signal_table_data(img: Image.Image) -> Optional[Dict[str, Any]]:
                     break
         if code and code != "RD":
             row_codes[tag] = code
-        if _table_x_is_checked(img, bbox, idx):
+        if _table_ok_is_checked(img, bbox, idx):
             checked_rows.append(tag)
 
     confirmations: List[str] = []
@@ -2903,7 +2904,7 @@ def page_new_signal() -> None:
                 st.caption(
                     "Tabella rilevata automaticamente · "
                     f"Formato: {str(td.get('table_format') or '—').upper()} · "
-                    f"X: {', '.join(td.get('checked_rows') or []) or 'nessuna'} · "
+                    f"OK: {', '.join(td.get('checked_rows') or []) or 'nessuno'} · "
                     f"TF: {td.get('setup_timeframe') or '—'}"
                 )
                 if td.get("table_text"):
@@ -3023,35 +3024,42 @@ def render_saved_signal_actions(row: Dict[str, Any], key_prefix: str) -> None:
         return
 
     sid = int(row["id"])
-    cols = st.columns(2)
+    c_read, c_delete, c_confirm = st.columns([1.45, 1.45, 1.0])
 
-    with cols[0]:
-        if st.button("🔁 Rileggi screenshot", key=f"{key_prefix}_reread_{sid}", use_container_width=True):
-            try:
-                msg = reread_signal_from_storage(sid)
-                # Manteniamo aperto il dettaglio Dashboard dopo la rilettura.
-                if str(key_prefix).startswith("dashboard_detail_"):
-                    st.session_state["dashboard_selected_signal_id"] = sid
-                _set_saved_signal_flash(key_prefix, msg)
-                st.rerun()
-            except Exception as e:
-                st.error(f"Rilettura screenshot non riuscita: {e}")
+    # La conferma viene calcolata prima, ma resa visivamente nella terza colonna.
+    confirm_delete = c_confirm.checkbox(
+        "Confermo eliminazione",
+        key=f"{key_prefix}_confirm_delete_{sid}",
+    )
 
-    with cols[1]:
-        confirm_delete = st.checkbox("Confermo eliminazione", key=f"{key_prefix}_confirm_delete_{sid}")
-        if st.button(
-            "🗑️ Elimina segnale",
-            key=f"{key_prefix}_delete_{sid}",
-            use_container_width=True,
-            disabled=not confirm_delete,
-        ):
-            try:
-                delete_signal_with_assets(sid)
-                st.session_state.pop("dashboard_selected_signal_id", None)
-                _set_saved_signal_flash(key_prefix, f"Segnale #{sid} eliminato.")
-                st.rerun()
-            except Exception as e:
-                st.error(f"Eliminazione non riuscita: {e}")
+    if c_read.button(
+        "🔁 Rileggi screenshot",
+        key=f"{key_prefix}_reread_{sid}",
+        use_container_width=True,
+    ):
+        try:
+            msg = reread_signal_from_storage(sid)
+            # Manteniamo aperto il dettaglio Dashboard dopo la rilettura.
+            if str(key_prefix).startswith("dashboard_detail_"):
+                st.session_state["dashboard_selected_signal_id"] = sid
+            _set_saved_signal_flash(key_prefix, msg)
+            st.rerun()
+        except Exception as e:
+            st.error(f"Rilettura screenshot non riuscita: {e}")
+
+    if c_delete.button(
+        "🗑️ Elimina segnale",
+        key=f"{key_prefix}_delete_{sid}",
+        use_container_width=True,
+        disabled=not confirm_delete,
+    ):
+        try:
+            delete_signal_with_assets(sid)
+            st.session_state.pop("dashboard_selected_signal_id", None)
+            _set_saved_signal_flash(key_prefix, f"Segnale #{sid} eliminato.")
+            st.rerun()
+        except Exception as e:
+            st.error(f"Eliminazione non riuscita: {e}")
 
 
 def _optional_path(value: Any) -> str:
