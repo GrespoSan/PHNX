@@ -20,7 +20,7 @@ import yfinance as yf
 from supabase import create_client, Client
 
 APP_NAME = "G. Signal Tracker"
-APP_VERSION = "V5.1"
+APP_VERSION = "V5.2"
 BUCKET_NAME = "signal-screenshots"
 LOCAL_TZ = ZoneInfo("Europe/Rome")
 
@@ -42,7 +42,7 @@ CONFIRMATIONS = [
 ]
 
 # Codici usati nella nuova tabella inserita negli screenshot.
-# La conferma viene attivata SOLO quando accanto al codice è presente una X.
+# La conferma viene attivata SOLO quando nella quarta colonna è presente OK.
 CONFIRMATION_CODE_MAP = {
     "RD": "Revolving Door",
     "STOC/TDI": "Stocastico/TDI",
@@ -2697,87 +2697,239 @@ def _reset_new_signal_widget_state() -> None:
                 pass
 
 
-def extract_signal_payload_from_image(img: Image.Image) -> Dict[str, Any]:
-    """Pipeline OCR V4.9 con priorità esplicite e controllabili.
 
-    FULL table: valori tabella > scala destra > OCR generale.
-    COMPACT table: scala destra > OCR generale (la tabella non contiene prezzi).
+def _select_regular_grid_edges(edges: List[int], expected: int) -> List[int]:
+    """Seleziona il gruppo di bordi più regolare della griglia standard."""
+    vals = sorted({int(v) for v in edges})
+    if len(vals) < expected:
+        return []
+    if len(vals) == expected:
+        return vals
+
+    best: List[int] = []
+    best_score: Optional[float] = None
+    for start in range(0, len(vals) - expected + 1):
+        cand = vals[start:start + expected]
+        diffs = np.diff(np.array(cand, dtype=float))
+        if len(diffs) == 0 or np.min(diffs) <= 0:
+            continue
+        mean = float(np.mean(diffs))
+        cv = float(np.std(diffs) / mean) if mean > 0 else 999.0
+        span = float(cand[-1] - cand[0])
+        # Priorità alla regolarità; a parità, preferisci la griglia più estesa.
+        score = cv * 1000.0 - span * 0.001
+        if best_score is None or score < best_score:
+            best_score = score
+            best = cand
+    return best
+
+
+def _fast_table10_cells(img: Image.Image) -> Dict[str, Any]:
+    """Legge la tabella standard 10x4 con UNA sola chiamata Tesseract.
+
+    Struttura fissa:
+      col 1 = CAMPO
+      col 2 = VALORE
+      col 3 = CONFERMA
+      col 4 = OK
+
+    Righe:
+      STRUMENTO, DATA, DIREZIONE, E1, E2, S1, S2, T1, T2, T3.
+
+    La tabella può essere spostata nel grafico: viene prima localizzata tramite
+    la griglia blu, poi l'OCR viene eseguito soltanto sul suo riquadro.
     """
-    full_text, top_text = run_ocr(img)
-    parsed = parse_signal(full_text, top_text)
-    table_data = extract_signal_table_data(img)
+    bbox = _detect_signal_table_bbox(img)
+    if not bbox:
+        raise RuntimeError(
+            'Tabella standard non rilevata. Verifica che la tabella 10x4 sia interamente visibile e con la griglia blu.'
+        )
 
-    # Nuovo lettore strutturale delle linee: non dipende dal testo E1/E2/T1/T2.
-    direction_hint = str((table_data or {}).get("direction") or parsed.get("direction") or "")
-    right_levels, inferred_direction, right_debug = extract_levels_from_right_scale(img, direction_hint=direction_hint)
-    # Manteniamo anche il vecchio fallback OCR per eventuali screenshot storici.
-    legacy_levels = extract_chart_levels_from_lines(img)
-    chart_levels = dict(legacy_levels)
-    chart_levels.update(right_levels)
+    h_edges, v_edges = _table_grid_edges(img, bbox)
+    h_edges = _select_regular_grid_edges(h_edges, 11)
+    v_edges = _select_regular_grid_edges(v_edges, 5)
+    if len(h_edges) != 11 or len(v_edges) != 5:
+        raise RuntimeError(
+            f'Griglia tabella non riconosciuta correttamente (righe={max(0, len(h_edges)-1)}, colonne={max(0, len(v_edges)-1)}). '
+            'Usa la struttura standard 10 righe × 4 colonne senza celle unite.'
+        )
 
-    table_format = str((table_data or {}).get("table_format") or "")
+    # Il bbox reale viene ricostruito direttamente dai bordi della griglia.
+    table_bbox = (v_edges[0], h_edges[0], v_edges[-1] + 1, h_edges[-1] + 1)
+    crop = img.crop(table_bbox).convert('RGB')
+    arr = np.array(crop).copy()
+    rr = arr[:, :, 0].astype(np.int16)
+    gg = arr[:, :, 1].astype(np.int16)
+    bb = arr[:, :, 2].astype(np.int16)
 
-    if table_data:
-        if table_data.get("valid_date"):
-            parsed["valid_date"] = table_data["valid_date"]
-        if table_data.get("direction") in {"LONG", "SHORT"}:
-            parsed["direction"] = table_data["direction"]
-        elif inferred_direction in {"LONG", "SHORT"}:
-            parsed["direction"] = inferred_direction
+    # Rimuove esclusivamente la griglia blu. Il testo nero resta intatto; funziona
+    # sia con sfondo bianco sia con grigio molto chiaro.
+    blue = (bb > 145) & ((bb - rr) > 22) & ((bb - gg) > 8)
+    arr[blue] = 255
+    clean = Image.fromarray(arr)
 
-        if table_data.get("setup_origin") not in (None, "", "—"):
-            parsed["setup_origin"] = table_data["setup_origin"]
-        if table_data.get("setup_timeframe") not in (None, "", "—"):
-            parsed["setup_timeframe"] = table_data["setup_timeframe"]
-        parsed["confirmations"] = list(table_data.get("confirmations") or [])
+    # Porta il riquadro a una dimensione OCR stabile senza ingrandire inutilmente.
+    scale = int(round(1400 / max(1, clean.width)))
+    scale = max(2, min(5, scale))
+    clean = clean.resize(
+        (max(1, clean.width * scale), max(1, clean.height * scale)),
+        Image.Resampling.LANCZOS,
+    )
+    clean = ImageOps.grayscale(clean)
+    clean = ImageOps.autocontrast(clean)
+    clean = ImageEnhance.Contrast(clean).enhance(1.8)
 
-        if table_format == "compact":
-            # Nel formato compatto i numeri NON sono nella tabella: evitiamo che un
-            # OCR generale sporco (es. E1=9.584) prevalga sui cartellini a destra.
-            for field in ("e1", "s1", "e2", "s2", "t1", "t2", "t3"):
-                parsed[field] = chart_levels.get(field)
-        else:
-            # Tabella completa: numeri tabella sono la fonte primaria; scala destra
-            # e OCR generale servono solo se una cella non viene letta.
-            for field in ("e1", "e2", "t1", "t2", "t3"):
-                value = table_data.get(field)
-                if value is not None:
-                    parsed[field] = value
-                elif chart_levels.get(field) is not None:
-                    parsed[field] = chart_levels[field]
-            shared_stop = table_data.get("shared_stop")
-            if shared_stop is not None:
-                parsed["s1"] = shared_stop
-                parsed["s2"] = shared_stop
-            else:
-                for field in ("s1", "s2"):
-                    if chart_levels.get(field) is not None:
-                        parsed[field] = chart_levels[field]
+    try:
+        data = pytesseract.image_to_data(
+            clean,
+            config='--psm 6',
+            output_type=pytesseract.Output.DICT,
+        )
+    except Exception as e:
+        raise RuntimeError(f'OCR tabella non disponibile: {e}') from e
+
+    rel_h = [int(y - table_bbox[1]) for y in h_edges]
+    rel_v = [int(x - table_bbox[0]) for x in v_edges]
+    cells: List[List[List[Tuple[float, str]]]] = [
+        [[] for _ in range(4)] for _ in range(10)
+    ]
+
+    n = len(data.get('text', []))
+    for i in range(n):
+        token = str(data['text'][i] or '').strip()
+        if not token:
+            continue
+        try:
+            conf = float(data.get('conf', ['-1'] * n)[i])
+        except Exception:
+            conf = -1.0
+        if conf < 20:
+            continue
+        try:
+            left = float(data['left'][i]) / scale
+            top = float(data['top'][i]) / scale
+            width = float(data['width'][i]) / scale
+            height = float(data['height'][i]) / scale
+        except Exception:
+            continue
+        cx = left + width / 2.0
+        cy = top + height / 2.0
+
+        row_idx = next((r for r in range(10) if rel_h[r] < cy < rel_h[r + 1]), None)
+        col_idx = next((c for c in range(4) if rel_v[c] < cx < rel_v[c + 1]), None)
+        if row_idx is None or col_idx is None:
+            continue
+        cells[row_idx][col_idx].append((cx, token))
+
+    def cell_text(row: int, col: int) -> str:
+        items = sorted(cells[row][col], key=lambda item: item[0])
+        return ' '.join(token for _, token in items).strip()
+
+    matrix = [[cell_text(r, c) for c in range(4)] for r in range(10)]
+    return {
+        'bbox': table_bbox,
+        'h_edges': h_edges,
+        'v_edges': v_edges,
+        'cells': matrix,
+        'ocr_text': '\n'.join(' | '.join(row) for row in matrix),
+    }
+
+
+def _fast_table10_payload(img: Image.Image) -> Dict[str, Any]:
+    """Converte la tabella standard nei campi dell'app.
+
+    Origine setup e Timeframe NON vengono letti automaticamente: restano manuali.
+    Le conferme sono attive esclusivamente se la rispettiva cella contiene OK.
+    """
+    table = _fast_table10_cells(img)
+    cells = table['cells']
+
+    instrument_raw = str(cells[0][1] or '').strip()
+    found = _known_instrument_from_text(instrument_raw)
+    if found:
+        instrument, ticker = found
     else:
-        if inferred_direction in {"LONG", "SHORT"} and not parsed.get("direction"):
-            parsed["direction"] = inferred_direction
-        for field, value in chart_levels.items():
-            if value is not None:
-                parsed[field] = value
+        instrument, ticker = instrument_raw, ''
 
-    for field in ("e1", "s1", "e2", "s2", "t1", "t2", "t3"):
-        parsed[field] = normalize_level_for_instrument(parsed.get("instrument"), parsed.get(field))
+    valid_date = parse_date(str(cells[1][1] or ''))
+
+    direction_raw = re.sub(r'[^A-Z0-9]', '', str(cells[2][1] or '').upper()).replace('0', 'O')
+    direction = 'SHORT' if 'SHORT' in direction_raw else ('LONG' if 'LONG' in direction_raw else '')
+
+    row_value_map = {
+        'e1': 3,
+        'e2': 4,
+        's1': 5,
+        's2': 6,
+        't1': 7,
+        't2': 8,
+        't3': 9,
+    }
+    levels: Dict[str, Optional[float]] = {
+        field: normalize_number(str(cells[row][1] or ''))
+        for field, row in row_value_map.items()
+    }
+
+    confirmation_rows = [
+        ('RD', 0),
+        ('STOC/TDI', 1),
+        ('MM', 2),
+        ('M4', 3),
+        ('ST', 4),
+        ('DIV', 5),
+        ('FIBO', 6),
+    ]
+    confirmations: List[str] = []
+    checked_rows: List[str] = []
+
+    for code, row in confirmation_rows:
+        ok_raw = re.sub(r'[^A-Z0-9]', '', str(cells[row][3] or '').upper()).replace('0', 'O')
+        if ok_raw != 'OK':
+            continue
+        checked_rows.append(code)
+        label = CONFIRMATION_CODE_MAP.get(code)
+        if label and label not in confirmations:
+            confirmations.append(label)
 
     return {
-        **parsed,
-        "full_text": full_text,
-        "top_text": top_text,
-        "chart_levels": chart_levels,
-        "right_scale_debug": right_debug,
-        "table_data": table_data or {},
+        'valid_date': valid_date,
+        'instrument': canonical_instrument_label(instrument),
+        'ticker': ticker,
+        'direction': direction,
+        **levels,
+        'setup_origin': '—',
+        'setup_timeframe': '—',
+        'confirmations': confirmations,
+        'full_text': table['ocr_text'],
+        'top_text': '',
+        'chart_levels': {},
+        'table_data': {
+            'bbox': table['bbox'],
+            'table_format': 'STANDARD_10X4',
+            'table_text': table['ocr_text'],
+            'checked_rows': checked_rows,
+            'setup_origin': '—',
+            'setup_timeframe': '—',
+            'cells': cells,
+        },
     }
+
+
+def extract_signal_payload_from_image(img: Image.Image) -> Dict[str, Any]:
+    """OCR V5.2: legge esclusivamente la tabella standard 10x4.
+
+    Non analizza più il grafico, le linee, la scala prezzi o il timeframe.
+    Questo rende la lettura molto più rapida e deterministica.
+    """
+    return _fast_table10_payload(img)
+
 
 def page_new_signal() -> None:
     if not can_write():
         st.error("Il tuo profilo è in sola lettura.")
         return
     st.subheader("Carica nuovo segnale")
-    st.caption("Carica lo screenshot; l'OCR compila i campi e puoi correggerli prima del salvataggio.")
+    st.caption("Carica lo screenshot; l'OCR legge esclusivamente la tabella standard 10x4. Origine e Timeframe restano manuali.")
 
     uploaded = st.file_uploader("Carica screenshot Telegram / TradingView", type=["png", "jpg", "jpeg", "webp"])
     if not uploaded:
@@ -2947,21 +3099,14 @@ def page_new_signal() -> None:
                 st.error(f"Salvataggio non riuscito: {e}")
 
     if ocr.get("full_text"):
-        with st.expander("Testo letto dall'OCR"):
-            if ocr.get("chart_levels"):
-                detected = " · ".join(f"{k.upper()} {fmt_num(v)}" for k, v in ocr["chart_levels"].items())
-                st.caption(f"Livelli letti direttamente dalle linee/scala destra: {detected}")
+        with st.expander("Lettura tabella OCR"):
             td = ocr.get("table_data") or {}
-            if td:
-                st.caption(
-                    "Tabella rilevata automaticamente · "
-                    f"Formato: {str(td.get('table_format') or '—').upper()} · "
-                    f"OK: {', '.join(td.get('checked_rows') or []) or 'nessuno'} · "
-                    f"TF: {td.get('setup_timeframe') or '—'}"
-                )
-                if td.get("table_text"):
-                    st.code(str(td.get("table_text")), language=None)
-            st.code((ocr.get("top_text", "") + "\n---\n" + ocr.get("full_text", "")).strip())
+            st.caption(
+                "Tabella standard 10x4 · "
+                f"OK rilevati: {', '.join(td.get('checked_rows') or []) or 'nessuno'} · "
+                "Origine e Timeframe: manuali"
+            )
+            st.code(str(td.get("table_text") or ocr.get("full_text") or ""), language=None)
 
 
 def _set_saved_signal_flash(key_prefix: str, message: str) -> None:
@@ -3002,18 +3147,17 @@ def reread_signal_from_storage(signal_id: int) -> str:
     if str(ocr.get("direction") or "").strip() in {"LONG", "SHORT"}:
         updates["direction"] = str(ocr.get("direction")).strip()
 
-    for field in ("e1", "s1", "e2", "s2", "t1", "t2", "t3"):
-        value = ocr.get(field)
-        if value is not None:
-            updates[field] = value
+    # La tabella V5.2 è la fonte del segnale: i campi vuoti intenzionali
+    # eliminano eventuali vecchi valori. T3 viene aggiornato solo se la colonna
+    # esiste nel database oppure se è effettivamente valorizzato.
+    for field in ("e1", "s1", "e2", "s2", "t1", "t2"):
+        updates[field] = ocr.get(field)
+    if "t3" in row or ocr.get("t3") is not None:
+        updates["t3"] = ocr.get("t3")
 
-    if ocr.get("setup_origin") not in (None, "", "—"):
-        updates["setup_origin"] = ocr["setup_origin"]
-    if ocr.get("setup_timeframe") not in (None, "", "—"):
-        updates["setup_timeframe"] = ocr["setup_timeframe"]
-    confirmations = list(ocr.get("confirmations") or [])
-    if confirmations:
-        updates["confirmations"] = confirmations
+    # Origine e Timeframe restano volutamente manuali e quindi NON vengono
+    # sovrascritti da Rileggi screenshot.
+    updates["confirmations"] = list(ocr.get("confirmations") or [])
 
     existing_entry = _numeric_or_none(row.get("actual_entry"))
     existing_stop = _numeric_or_none(row.get("actual_stop"))
@@ -3049,9 +3193,9 @@ def reread_signal_from_storage(signal_id: int) -> str:
 
     update_signal(int(signal_id), **updates)
     return (
-        "Screenshot riletto e dati aggiornati. Il monitoraggio verrà ricalcolato con i nuovi livelli."
+        "Tabella riletta e dati aggiornati. Il monitoraggio verrà ricalcolato con i nuovi livelli."
         if monitoring_changed else
-        "Screenshot riletto e dati aggiornati."
+        "Tabella riletta e dati aggiornati."
     )
 
 
