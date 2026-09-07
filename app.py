@@ -21,7 +21,7 @@ import yfinance as yf
 from supabase import create_client, Client
 
 APP_NAME = "G. Signal Tracker"
-APP_VERSION = "V5.13"
+APP_VERSION = "V5.14"
 BUCKET_NAME = "signal-screenshots"
 LOCAL_TZ = ZoneInfo("Europe/Rome")
 
@@ -2180,7 +2180,14 @@ def fetch_intraday(ticker: str, start_dt: datetime) -> Tuple[pd.DataFrame, str]:
 
 
 def _store_market_quote(ticker: str, price: Optional[float], quote_time: Any = None, source: str = "Yahoo Finance") -> None:
-    """Conserva in sessione l'ultimo prezzo già letto, evitando richieste duplicate a Yahoo."""
+    """Conserva in sessione prezzo e timestamp Yahoo separati dall'ora della richiesta.
+
+    IMPORTANTISSIMO:
+    - `time` = ora reale del dato Yahoo, se Yahoo la fornisce;
+    - `fetched_at` = ora in cui l'app ha interrogato Yahoo.
+
+    Non dobbiamo mai spacciare `fetched_at` per timestamp del prezzo.
+    """
     if not ticker or price is None:
         return
     try:
@@ -2190,34 +2197,39 @@ def _store_market_quote(ticker: str, price: Optional[float], quote_time: Any = N
     except Exception:
         return
 
-    if quote_time is None:
-        ts = local_now().isoformat(timespec="seconds")
-    else:
+    ts = None
+    if quote_time is not None:
         try:
             if hasattr(quote_time, "isoformat"):
                 ts = quote_time.isoformat()
             else:
                 ts = str(quote_time)
         except Exception:
-            ts = local_now().isoformat(timespec="seconds")
+            ts = None
 
     quotes = st.session_state.setdefault("market_quotes", {})
-    quotes[str(ticker)] = {"price": value, "time": ts, "source": source}
+    quotes[str(ticker)] = {
+        "price": value,
+        "time": ts,
+        "fetched_at": local_now().isoformat(timespec="seconds"),
+        "source": source,
+    }
 
 
 def _recent_market_quote(ticker: str, max_age_seconds: int = 45) -> Optional[Dict[str, Any]]:
+    """Riuso di cache basato sull'ora della richiesta, NON sull'ora del mercato."""
     if not ticker:
         return None
     item = (st.session_state.get("market_quotes") or {}).get(str(ticker))
     if not item or item.get("price") is None:
         return None
     try:
-        ts = datetime.fromisoformat(str(item.get("time", "")).replace("Z", "+00:00"))
-        if ts.tzinfo is None:
-            ts = ts.replace(tzinfo=LOCAL_TZ)
+        fetched_at = datetime.fromisoformat(str(item.get("fetched_at", "")).replace("Z", "+00:00"))
+        if fetched_at.tzinfo is None:
+            fetched_at = fetched_at.replace(tzinfo=LOCAL_TZ)
         else:
-            ts = ts.astimezone(LOCAL_TZ)
-        if local_now() - ts > timedelta(seconds=max_age_seconds):
+            fetched_at = fetched_at.astimezone(LOCAL_TZ)
+        if local_now() - fetched_at > timedelta(seconds=max_age_seconds):
             return None
     except Exception:
         return None
@@ -2250,11 +2262,12 @@ def get_market_quote(
 
     price, source, yahoo_time = get_current_quote(ticker)
     if price is not None:
-        # Se Yahoo ci dà il timestamp della barra, salviamo QUELLO.
-        # In caso contrario usiamo l'ora della richiesta come fallback.
-        _store_market_quote(ticker, price, yahoo_time or local_now(), source)
+        # Salviamo l'ora Yahoo solo se esiste davvero.
+        # Se fast_info restituisce un prezzo senza timestamp, NON inventiamo l'ora corrente.
+        _store_market_quote(ticker, price, yahoo_time, source)
         recent = _recent_market_quote(ticker)
-        return price, source, str(recent.get("time")) if recent else (yahoo_time or now_iso())
+        quote_time = recent.get("time") if recent else yahoo_time
+        return price, source, str(quote_time) if quote_time else None
     return None, source, yahoo_time
 
 
@@ -2844,7 +2857,7 @@ def yahoo_quote_age_minutes(value: Any) -> Optional[float]:
 def format_yahoo_quote_age(value: Any, stale_after_min: float = 5.0) -> str:
     age = yahoo_quote_age_minutes(value)
     if age is None:
-        return "—"
+        return "⚠️ N/D"
     if age < 1:
         return "<1 min"
     mins = int(round(age))
@@ -2937,7 +2950,7 @@ def styled_signals_dataframe(df: pd.DataFrame, quotes: Optional[Dict[str, Dict[s
         quote_info = quotes.get(effective_yahoo_ticker(raw)) if effective_yahoo_ticker(raw) else None
         quote_time = quote_info.get("time") if isinstance(quote_info, dict) else None
         quote_age = yahoo_quote_age_minutes(quote_time)
-        if quote_age is not None and quote_age > 5:
+        if quote_time is None or (quote_age is not None and quote_age > 5):
             set_style("Età dato", "color: #f59e0b; font-weight: 700;")
             set_style("Ora Yahoo", "color: #f59e0b; font-weight: 700;")
             set_style("Prezzo attuale", "color: #f59e0b; font-weight: 700;")
@@ -3905,7 +3918,7 @@ def dashboard_live_panel(auto_monitor: bool) -> None:
     if auto_monitor and can_write():
         st.caption(
             f"🟢 Monitoraggio automatico attivo · controllo ogni 60 secondi · ultimo controllo: {last_market_check_label(df)}. "
-            "Fonte Yahoo Finance: se Età dato supera 5 minuti il prezzo viene evidenziato in arancione e non deve essere considerato recente. I segnali chiusi non vengono aggiornati."
+            "Fonte Yahoo Finance: se Età dato supera 5 minuti, oppure Yahoo non fornisce un timestamp verificabile (N/D), il prezzo viene evidenziato in arancione e non deve essere considerato recente. I segnali chiusi non vengono aggiornati."
         )
     else:
         st.caption(f"Ultimo controllo mercato: {last_market_check_label(df)}")
