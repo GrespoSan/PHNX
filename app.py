@@ -20,7 +20,7 @@ import yfinance as yf
 from supabase import create_client, Client
 
 APP_NAME = "G. Signal Tracker"
-APP_VERSION = "V4.8"
+APP_VERSION = "V4.9"
 BUCKET_NAME = "signal-screenshots"
 LOCAL_TZ = ZoneInfo("Europe/Rome")
 
@@ -523,6 +523,147 @@ def _ocr_dark_price_near_y(img: Image.Image, y: int) -> Optional[float]:
                 integer_fallback = value
     return integer_fallback
 
+def _colored_right_label_lines(img: Image.Image) -> Dict[str, List[int]]:
+    """Rileva le estensioni tratteggiate verdi/rosse/blu vicino alla scala prezzi."""
+    arr = np.array(img.convert("RGB"))
+    h, w = arr.shape[:2]
+    xs, xe = int(w * 0.76), int(w * 0.945)
+    reg = arr[:, xs:xe]
+    rr = reg[:, :, 0].astype(np.int16)
+    gg = reg[:, :, 1].astype(np.int16)
+    bb = reg[:, :, 2].astype(np.int16)
+    masks = {
+        "green": (gg - rr > 15) & (gg - bb > 3) & (gg > 65),
+        "red": (rr - gg > 20) & (rr - bb > 5) & (rr > 80),
+        "blue": (bb - rr > 20) & (bb - gg > 5) & (bb > 80),
+    }
+    black_lines = _candidate_horizontal_lines(img)
+    out: Dict[str, List[int]] = {"green": [], "red": [], "blue": []}
+
+    for color, mask in masks.items():
+        y_sum = mask.sum(axis=1)
+        ys = np.where(y_sum > 3)[0]
+        groups: List[List[int]] = []
+        for y in ys:
+            if not groups or y - groups[-1][-1] > 2:
+                groups.append([])
+            groups[-1].append(int(y))
+        for group in groups:
+            weights = np.array([max(1, int(y_sum[y])) for y in group], dtype=float)
+            yc = int(round(np.average(group, weights=weights)))
+            row = mask[max(0, min(group) - 1):min(h, max(group) + 2)]
+            xx = np.where(row.any(axis=0))[0] + xs
+            if len(xx) == 0:
+                continue
+            x_min, x_max = int(xx.min()), int(xx.max())
+            span = x_max - x_min + 1
+            # Le etichette E/S/T e le loro tratteggiate stanno solo nell'ultima fascia.
+            # Le Balance/trendline più lunghe vengono così escluse.
+            if x_min < int(w * 0.82) or span < max(8, int(w * 0.008)) or span > int(w * 0.15):
+                continue
+            if not black_lines:
+                continue
+            ly = min(black_lines, key=lambda yy: abs(yy - yc))
+            if abs(ly - yc) <= 5 and ly not in out[color]:
+                out[color].append(int(ly))
+        out[color].sort()
+
+    # A volte l'antialias blu di T1 produce anche pochi pixel rossi: il blu vince.
+    out["red"] = [y for y in out["red"] if all(abs(y - by) > 4 for by in out["blue"])]
+    return out
+
+
+def _localized_price_token(raw: str) -> Optional[str]:
+    pattern = re.compile(r"(?<!\d)(\d{1,3}(?:[.,]\d{3})+(?:[.,]\d+)?|\d+(?:[.,]\d+)?)(?!\d)")
+    matches = pattern.findall(str(raw or ""))
+    if not matches:
+        return None
+    return max(matches, key=len)
+
+
+def _ocr_axis_price_at_y(img: Image.Image, y: int) -> Optional[float]:
+    """Legge il cartellino nero sulla scala destra alla stessa quota della linea.
+
+    Supporta anche il formato italiano 29.584,25; la regex precedente della V4.8
+    si fermava a 29.584 ed era una delle cause principali dei valori sbagliati.
+    """
+    w, h = img.size
+    x0, x1 = int(w * 0.94), int(w * 0.999)
+    candidates: List[Tuple[Tuple[int, int, int], float]] = []
+    for off in (0, -2, 2, -4, 4):
+        yy = max(13, min(h - 14, int(y + off)))
+        crop = ImageOps.grayscale(img.crop((x0, yy - 12, x1, yy + 13)))
+        crop = crop.resize((max(1, crop.width * 7), max(1, crop.height * 7)), Image.Resampling.LANCZOS)
+        arr = np.array(crop)
+        for threshold in (80, 110):
+            bw = Image.fromarray(np.where(arr < threshold, 0, 255).astype("uint8"))
+            try:
+                raw = pytesseract.image_to_string(
+                    bw, config="--psm 7 -c tessedit_char_whitelist=0123456789.,"
+                ).strip()
+            except Exception:
+                continue
+            token = _localized_price_token(raw)
+            if not token:
+                continue
+            value = normalize_number(token)
+            if value is None:
+                continue
+            separators = int("." in token) + int("," in token)
+            candidates.append(((separators, len(token), -abs(off)), value))
+    return max(candidates, key=lambda item: item[0])[1] if candidates else None
+
+
+def extract_levels_from_right_scale(img: Image.Image) -> Tuple[Dict[str, float], str, Dict[str, Any]]:
+    """Legge E/S/T dalle linee colorate e il prezzo dalla scala destra.
+
+    Non usa OCR sul testo E1/E2/T1/T2: usa geometria e colore, poi associa il
+    cartellino prezzo nero alla stessa quota. Questo è il motore principale per
+    il nuovo formato compatto senza valori numerici nella tabella.
+    """
+    lines = _colored_right_label_lines(img)
+    greens = list(lines.get("green") or [])
+    blues = list(lines.get("blue") or [])
+    reds = list(lines.get("red") or [])
+    direction = ""
+    if greens and blues:
+        # y maggiore = prezzo più basso sul grafico.
+        direction = "SHORT" if float(np.mean(blues)) > float(np.mean(greens)) else "LONG"
+
+    if direction == "LONG":
+        entry_ys = sorted(greens)              # E1 più alto, E2 più basso
+        target_ys = sorted(blues, reverse=True) # T1 più vicino, poi T2/T3 verso l'alto
+    elif direction == "SHORT":
+        entry_ys = sorted(greens, reverse=True) # E1 più basso, E2 più alto
+        target_ys = sorted(blues)               # T1 più vicino, poi T2/T3 verso il basso
+    else:
+        entry_ys = sorted(greens)
+        target_ys = sorted(blues)
+
+    result: Dict[str, float] = {}
+    for i, yy in enumerate(entry_ys[:2], start=1):
+        value = _ocr_axis_price_at_y(img, yy)
+        if value is not None:
+            result[f"e{i}"] = value
+    for i, yy in enumerate(target_ys[:3], start=1):
+        value = _ocr_axis_price_at_y(img, yy)
+        if value is not None:
+            result[f"t{i}"] = value
+
+    # Associa ogni stop rosso all'entry per cui si trova sul lato protettivo.
+    if direction and entry_ys and reds:
+        for i, ey in enumerate(entry_ys[:2], start=1):
+            protective = [ry for ry in reds if (ry > ey if direction == "LONG" else ry < ey)]
+            if not protective:
+                continue
+            ry = min(protective, key=lambda value: abs(value - ey))
+            value = _ocr_axis_price_at_y(img, ry)
+            if value is not None:
+                result[f"s{i}"] = value
+
+    return result, direction, {"colored_lines": lines}
+
+
 def extract_chart_levels_from_lines(img: Image.Image) -> Dict[str, float]:
     """
     OCR posizionale: associa E1/E2/S1/S2/T1/T2/T3 alle linee orizzontali
@@ -747,11 +888,12 @@ def extract_confirmation_codes_by_row(text: str) -> Dict[str, str]:
 
 
 def _detect_signal_table_bbox(img: Image.Image) -> Optional[Tuple[int, int, int, int]]:
-    """Trova automaticamente la tabella azzurra, ovunque sia posizionata nello screenshot.
+    """Trova automaticamente la tabella azzurra, sia nel formato largo sia compatto.
 
-    Il template usa un fondo azzurro molto chiaro. Lavoriamo su una copia ridotta e
-    cerchiamo la componente con area, densità e proporzioni compatibili con la griglia.
-    Non usiamo coordinate fisse: la tabella può essere spostata sul grafico.
+    V4.9: il vecchio detector richiedeva una tabella più larga che alta e quindi
+    falliva sul nuovo formato compatto a due colonne. Qui includiamo anche le linee
+    azzurre della griglia nella stessa componente e accettiamo entrambi i rapporti.
+    La posizione assoluta dell'oggetto non viene usata.
     """
     max_w = 900
     scale = min(1.0, max_w / max(1, img.width))
@@ -761,8 +903,8 @@ def _detect_signal_table_bbox(img: Image.Image) -> Optional[Tuple[int, int, int,
     gg = arr[:, :, 1].astype(np.int16)
     bb = arr[:, :, 2].astype(np.int16)
 
-    # Fondo della tabella: chiaro, con dominante blu. Esclude trendline ciano e box scuri.
-    mask = (rr > 160) & (gg > 170) & (bb > 190) & ((bb - rr) > 10) & ((bb - gg) > 4)
+    # Fondo + griglia azzurra: soglia volutamente più ampia del vecchio motore.
+    mask = (rr > 90) & (gg > 110) & (bb > 150) & ((bb - rr) > 8) & ((bb - gg) > 3)
     h, w = mask.shape
     seen = np.zeros_like(mask, dtype=bool)
     candidates: List[Tuple[float, int, int, int, int]] = []
@@ -781,22 +923,25 @@ def _detect_signal_table_bbox(img: Image.Image) -> Optional[Tuple[int, int, int,
                 count += 1
                 min_x = min(min_x, xx); max_x = max(max_x, xx)
                 min_y = min(min_y, yy); max_y = max(max_y, yy)
-                for dy, dx in ((1, 0), (-1, 0), (0, 1), (0, -1)):
-                    ny, nx = yy + dy, xx + dx
-                    if 0 <= ny < h and 0 <= nx < w and mask[ny, nx] and not seen[ny, nx]:
-                        seen[ny, nx] = True
-                        stack.append((ny, nx))
+                for dy in (-1, 0, 1):
+                    for dx in (-1, 0, 1):
+                        if dx == 0 and dy == 0:
+                            continue
+                        ny, nx = yy + dy, xx + dx
+                        if 0 <= ny < h and 0 <= nx < w and mask[ny, nx] and not seen[ny, nx]:
+                            seen[ny, nx] = True
+                            stack.append((ny, nx))
 
             bw = max_x - min_x + 1
             bh = max_y - min_y + 1
-            if bw < max(70, int(w * 0.08)) or bh < max(45, int(h * 0.07)):
+            if bw < max(45, int(w * 0.04)) or bh < max(40, int(h * 0.05)):
                 continue
             aspect = bw / max(1, bh)
             density = count / max(1, bw * bh)
-            if not (1.15 <= aspect <= 5.0 and density >= 0.35):
+            # Compatto ~0.65-0.80; completo ~1.5-2.0.
+            if not (0.40 <= aspect <= 4.2 and density >= 0.25):
                 continue
-            score = float(count) * density
-            candidates.append((score, min_x, min_y, max_x, max_y))
+            candidates.append((float(count) * density, min_x, min_y, max_x, max_y))
 
     if not candidates:
         return None
@@ -808,6 +953,127 @@ def _detect_signal_table_bbox(img: Image.Image) -> Optional[Tuple[int, int, int,
     y1 = min(img.height, int(round((max_y + 1) * inv)) + 2)
     return (x0, y0, x1, y1)
 
+
+def _detect_adjacent_context_box(img: Image.Image, bbox: Tuple[int, int, int, int]) -> Optional[Tuple[int, int, int, int]]:
+    """Trova il box blu/viola con simbolo-data e Timeframe vicino alla tabella."""
+    x0, y0, x1, y1 = bbox
+    tw = max(1, x1 - x0)
+    th = max(1, y1 - y0)
+    sx0 = max(0, x1 + int(0.02 * tw))
+    sx1 = min(img.width, x1 + int(2.2 * tw))
+    sy0 = max(0, y0 - int(0.18 * th))
+    sy1 = min(img.height, y0 + int(0.50 * th))
+    if sx1 <= sx0 or sy1 <= sy0:
+        return None
+
+    arr = np.array(img.crop((sx0, sy0, sx1, sy1)).convert("RGB"))
+    rr = arr[:, :, 0].astype(np.int16)
+    gg = arr[:, :, 1].astype(np.int16)
+    bb = arr[:, :, 2].astype(np.int16)
+    mask = (bb > 80) & ((bb - rr) > 20) & ((bb - gg) > 5) & (rr < 180) & (gg < 190)
+    h, w = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    candidates: List[Tuple[int, int, int, int, int]] = []
+
+    for y in range(h):
+        for x in range(w):
+            if not mask[y, x] or seen[y, x]:
+                continue
+            stack = [(y, x)]
+            seen[y, x] = True
+            min_x = max_x = x; min_y = max_y = y; count = 0
+            while stack:
+                yy, xx = stack.pop(); count += 1
+                min_x = min(min_x, xx); max_x = max(max_x, xx)
+                min_y = min(min_y, yy); max_y = max(max_y, yy)
+                for dy in (-1, 0, 1):
+                    for dx in (-1, 0, 1):
+                        if dx == 0 and dy == 0:
+                            continue
+                        ny, nx = yy + dy, xx + dx
+                        if 0 <= ny < h and 0 <= nx < w and mask[ny, nx] and not seen[ny, nx]:
+                            seen[ny, nx] = True
+                            stack.append((ny, nx))
+            bw = max_x - min_x + 1; bh = max_y - min_y + 1
+            if bw >= max(45, int(tw * 0.25)) and bh >= max(15, int(th * 0.07)) and bw / max(1, bh) >= 1.8:
+                candidates.append((count, min_x, min_y, max_x, max_y))
+
+    if not candidates:
+        return None
+    _, min_x, min_y, max_x, max_y = max(candidates, key=lambda c: c[0])
+    return (
+        max(0, sx0 + min_x - 2), max(0, sy0 + min_y - 2),
+        min(img.width, sx0 + max_x + 3), min(img.height, sy0 + max_y + 3),
+    )
+
+
+def _ocr_adjacent_context(img: Image.Image, bbox: Tuple[int, int, int, int]) -> Dict[str, Any]:
+    """Legge data e timeframe dal box colorato con OCR numerico a votazione.
+
+    Il testo bianco sul fondo colorato è poco leggibile da Tesseract se passato come
+    frase intera. La lettura dei soli numeri, su più soglie, è molto più stabile.
+    """
+    cb = _detect_adjacent_context_box(img, bbox)
+    if not cb:
+        return {"valid_date": None, "setup_timeframe": "—", "context_box": None, "context_text": ""}
+    x0, y0, x1, y1 = cb
+    w = max(1, x1 - x0); h = max(1, y1 - y0)
+    top = img.crop((x0 + int(w * 0.25), y0, x1, y0 + int(h * 0.48)))
+    bottom = img.crop((x0, y0 + int(h * 0.38), x1, y1))
+
+    date_votes: List[str] = []
+    debug_text: List[str] = []
+    for scale in (6, 8, 10):
+        enlarged = top.resize((max(1, top.width * scale), max(1, top.height * scale)), Image.Resampling.LANCZOS)
+        g = np.array(ImageOps.grayscale(enlarged))
+        for threshold in (110, 120, 130, 140, 150, 160, 170):
+            bw = Image.fromarray(np.where(g > threshold, 0, 255).astype("uint8"))
+            try:
+                raw = pytesseract.image_to_string(
+                    bw, config="--psm 7 -c tessedit_char_whitelist=0123456789-/!."
+                ).strip()
+            except Exception:
+                raw = ""
+            if raw:
+                debug_text.append(raw)
+            for m in re.finditer(r"(\d{1,2})[-/.](\d{1,2})[-/.](\d{2,4})", raw):
+                try:
+                    d, mo, yy = int(m.group(1)), int(m.group(2)), int(m.group(3))
+                    if yy < 100:
+                        yy += 2000
+                    date_votes.append(date(yy, mo, d).isoformat())
+                except Exception:
+                    pass
+
+    valid_date = max(set(date_votes), key=date_votes.count) if date_votes else None
+
+    tf_votes: List[int] = []
+    for scale in (6, 8, 10):
+        enlarged = bottom.resize((max(1, bottom.width * scale), max(1, bottom.height * scale)), Image.Resampling.LANCZOS)
+        g = np.array(ImageOps.grayscale(enlarged))
+        for threshold in (70, 80, 90, 100, 110, 120, 130, 140, 150, 160):
+            bw = Image.fromarray(np.where(g > threshold, 0, 255).astype("uint8"))
+            try:
+                raw = pytesseract.image_to_string(
+                    bw, config="--psm 7 -c tessedit_char_whitelist=0123456789"
+                ).strip()
+            except Exception:
+                raw = ""
+            m = re.search(r"\d{1,3}", raw)
+            if m:
+                n = int(m.group(0))
+                if n in {1, 2, 4, 15, 30, 60, 120, 240}:
+                    tf_votes.append(n)
+
+    tf_number = max(set(tf_votes), key=tf_votes.count) if tf_votes else None
+    tf_map = {1: "1H", 2: "2H", 4: "4H", 15: "15m", 30: "30m", 60: "1H", 120: "2H", 240: "4H"}
+    setup_timeframe = tf_map.get(tf_number, "—")
+    return {
+        "valid_date": valid_date,
+        "setup_timeframe": setup_timeframe,
+        "context_box": cb,
+        "context_text": " | ".join(debug_text[:6]),
+    }
 
 def _ocr_signal_table_text(img: Image.Image, bbox: Tuple[int, int, int, int]) -> str:
     """OCR dedicato alla sola tabella, dopo averla individuata automaticamente."""
@@ -1041,26 +1307,96 @@ def _checked_rows_from_table_bbox(img: Image.Image, bbox: Tuple[int, int, int, i
     return checked
 
 
-def extract_signal_table_data(img: Image.Image) -> Optional[Dict[str, Any]]:
-    """Estrae la tabella in modo posizionale e indipendente dalla sua posizione.
+def _compact_table_confirmations(img: Image.Image, bbox: Tuple[int, int, int, int]) -> Tuple[List[str], List[str]]:
+    """Legge le X nel formato compatto: RD + sei conferme, senza colonna valori."""
+    x0, y0, x1, y1 = bbox
+    w = max(1, x1 - x0); h = max(1, y1 - y0)
+    row_codes = ["RD", "STOC/TDI", "MM", "M4", "ST", "DIV", "FIBO"]
+    confirmations: List[str] = []
+    checked_rows: List[str] = []
+    for row_idx, code in enumerate(row_codes):
+        if row_idx == 0:
+            continue
+        yy0 = int(y0 + row_idx * h / 7.0) + 2
+        yy1 = int(y0 + (row_idx + 1) * h / 7.0) - 2
+        xx0 = int(x0 + w * 0.80) + 1
+        xx1 = x1 - 1
+        if yy1 <= yy0 or xx1 <= xx0:
+            continue
+        cell = np.array(ImageOps.grayscale(img.crop((xx0, yy0, xx1, yy1))))
+        if cell.size == 0:
+            continue
+        # La X è scura; la griglia/fondo restano molto più chiari. Soglia testata
+        # anche sull'immagine NQ con tabella compatta.
+        dark = int((cell < 180).sum())
+        if dark >= max(4, int(cell.size * 0.012)):
+            checked_rows.append(code)
+            label = CONFIRMATION_CODE_MAP.get(code)
+            if label and label not in confirmations:
+                confirmations.append(label)
+    return confirmations, checked_rows
 
-    V4.8: dopo aver trovato il bbox dinamico, legge ogni cella separatamente. Questo
-    evita errori come E1=4 dovuti a M4/X o ad altre righe vicine nel testo OCR globale.
+
+def extract_signal_table_data(img: Image.Image) -> Optional[Dict[str, Any]]:
+    """Estrae automaticamente entrambi i formati tabella usati negli screenshot.
+
+    - FULL: LONG/SHORT + data + RD, valori E1/E2/T1/T2/T3/Stop, conferme e X.
+    - COMPACT: RD + elenco conferme/X; i prezzi vengono letti dalle linee a destra.
     """
     bbox = _detect_signal_table_bbox(img)
     if not bbox:
         return None
+    x0, y0, x1, y1 = bbox
+    aspect = (x1 - x0) / max(1, (y1 - y0))
+    table_format = "compact" if aspect < 1.05 else "full"
+    context = _ocr_adjacent_context(img, bbox)
+    context_text = str(context.get("context_text") or "")
 
+    if table_format == "compact":
+        confirmations, checked_rows = _compact_table_confirmations(img, bbox)
+        # Il primo rigo del formato compatto è RD. Facciamo un piccolo OCR di controllo,
+        # ma tolleriamo D/O/0 perché su screenshot compressi RD viene spesso letto RO.
+        header_box = (x0 + 2, y0 + 2, int(x0 + (x1 - x0) * 0.80) - 2, int(y0 + (y1 - y0) / 7.0) - 2)
+        header_crop = ImageOps.grayscale(img.crop(header_box))
+        header_crop = header_crop.resize((max(1, header_crop.width * 8), max(1, header_crop.height * 8)), Image.Resampling.LANCZOS)
+        arr = np.array(header_crop)
+        bw = Image.fromarray(np.where(arr < 180, 0, 255).astype("uint8"))
+        try:
+            header_raw = pytesseract.image_to_string(
+                bw, config="--psm 7 -c tessedit_char_whitelist=RDO0"
+            ).strip().upper()
+        except Exception:
+            header_raw = ""
+        compact_header = re.sub(r"[^RDO0]", "", header_raw)
+        # Nel formato compatto la prima riga è, per definizione del template, RD.
+        # L'OCR di due sole lettere è poco affidabile (RD viene spesso letto RO/0),
+        # quindi il formato stesso è la fonte più robusta per l'origine.
+        setup_origin = "Revolving Door"
+        return {
+            "bbox": bbox,
+            "table_format": table_format,
+            "table_text": header_raw,
+            "context_text": context_text,
+            "valid_date": context.get("valid_date"),
+            "direction": "",
+            "e1": None, "e2": None, "t1": None, "t2": None, "t3": None,
+            "shared_stop": None,
+            "setup_origin": setup_origin,
+            "setup_timeframe": context.get("setup_timeframe") or "—",
+            "confirmations": confirmations,
+            "row_codes": {},
+            "checked_rows": checked_rows,
+        }
+
+    # Formato completo V4.5/V4.6: manteniamo la lettura cella-per-cella.
     table_text = _ocr_signal_table_text(img, bbox)
     segments = _table_row_segments(table_text)
-
     row_index = {"E1": 1, "E2": 2, "T1": 3, "T2": 4, "T3": 5, "STOP": 6}
     values: Dict[str, Optional[float]] = {}
     row_codes: Dict[str, str] = {}
     checked_rows: List[str] = []
 
     for tag, idx in row_index.items():
-        # Priorità assoluta alla cella valore dedicata.
         value = _ocr_table_numeric_cell(img, bbox, idx)
         if value is None and tag in segments:
             value = _numeric_from_table_segment(segments[tag])
@@ -1074,7 +1410,6 @@ def extract_signal_table_data(img: Image.Image) -> Optional[Dict[str, Any]]:
                     break
         if code and code != "RD":
             row_codes[tag] = code
-
         if _table_x_is_checked(img, bbox, idx):
             checked_rows.append(tag)
 
@@ -1085,38 +1420,30 @@ def extract_signal_table_data(img: Image.Image) -> Optional[Dict[str, Any]]:
         if label and label not in confirmations:
             confirmations.append(label)
 
-    context_text = _ocr_table_context_text(img, bbox)
     header_text = table_text + "\n" + context_text
     direction_match = re.search(r"\b(LONG|SHORT)\b", header_text, flags=re.I)
-
-    # RD è nel terzo campo della riga header; il testo globale resta un fallback.
     header_code = _ocr_table_code_cell(img, bbox, 0)
     setup_origin = (
         "Revolving Door"
         if header_code == "RD" or re.search(r"(?<![A-Z0-9])RD(?![A-Z0-9])", header_text, flags=re.I)
         else "—"
     )
-    setup_timeframe = _parse_timeframe_text(context_text)
-
     return {
         "bbox": bbox,
+        "table_format": table_format,
         "table_text": table_text,
         "context_text": context_text,
-        "valid_date": parse_date(header_text),
+        "valid_date": context.get("valid_date") or parse_date(header_text),
         "direction": direction_match.group(1).upper() if direction_match else "",
-        "e1": values.get("e1"),
-        "e2": values.get("e2"),
-        "t1": values.get("t1"),
-        "t2": values.get("t2"),
-        "t3": values.get("t3"),
+        "e1": values.get("e1"), "e2": values.get("e2"),
+        "t1": values.get("t1"), "t2": values.get("t2"), "t3": values.get("t3"),
         "shared_stop": values.get("stop"),
         "setup_origin": setup_origin,
-        "setup_timeframe": setup_timeframe,
+        "setup_timeframe": context.get("setup_timeframe") or _parse_timeframe_text(context_text),
         "confirmations": confirmations,
         "row_codes": row_codes,
         "checked_rows": checked_rows,
     }
-
 
 def extract_confirmations_from_table_image(img: Image.Image, ocr_text: str = "") -> Optional[List[str]]:
     """Compatibilità: usa il nuovo rilevamento dinamico della tabella."""
@@ -2319,43 +2646,78 @@ def _reset_new_signal_widget_state() -> None:
 
 
 def extract_signal_payload_from_image(img: Image.Image) -> Dict[str, Any]:
-    """Esegue l'intera pipeline OCR sullo screenshot e restituisce i campi del segnale."""
+    """Pipeline OCR V4.9 con priorità esplicite e controllabili.
+
+    FULL table: valori tabella > scala destra > OCR generale.
+    COMPACT table: scala destra > OCR generale (la tabella non contiene prezzi).
+    """
     full_text, top_text = run_ocr(img)
     parsed = parse_signal(full_text, top_text)
-
-    # Nuovo motore dedicato alla tabella: la individua ovunque sia posizionata,
-    # legge righe/valori, X, RD e il box Timeframe adiacente.
     table_data = extract_signal_table_data(img)
+
+    # Nuovo lettore strutturale delle linee: non dipende dal testo E1/E2/T1/T2.
+    right_levels, inferred_direction, right_debug = extract_levels_from_right_scale(img)
+    # Manteniamo anche il vecchio fallback OCR per eventuali screenshot storici.
+    legacy_levels = extract_chart_levels_from_lines(img)
+    chart_levels = dict(legacy_levels)
+    chart_levels.update(right_levels)
+
+    table_format = str((table_data or {}).get("table_format") or "")
+
     if table_data:
-        for field in ("valid_date", "direction", "e1", "e2", "t1", "t2", "t3"):
-            value = table_data.get(field)
-            if value not in (None, ""):
-                parsed[field] = value
-        shared_stop = table_data.get("shared_stop")
-        if shared_stop is not None:
-            parsed["s1"] = shared_stop
-            parsed["s2"] = shared_stop
+        if table_data.get("valid_date"):
+            parsed["valid_date"] = table_data["valid_date"]
+        if table_data.get("direction") in {"LONG", "SHORT"}:
+            parsed["direction"] = table_data["direction"]
+        elif inferred_direction in {"LONG", "SHORT"}:
+            parsed["direction"] = inferred_direction
+
         if table_data.get("setup_origin") not in (None, "", "—"):
             parsed["setup_origin"] = table_data["setup_origin"]
         if table_data.get("setup_timeframe") not in (None, "", "—"):
             parsed["setup_timeframe"] = table_data["setup_timeframe"]
         parsed["confirmations"] = list(table_data.get("confirmations") or [])
 
-    chart_levels = extract_chart_levels_from_lines(img)
-    for field in ("e1", "s1", "e2", "s2", "t1", "t2", "t3"):
-        if parsed.get(field) is None and chart_levels.get(field) is not None:
-            parsed[field] = normalize_level_for_instrument(parsed.get("instrument"), chart_levels[field])
+        if table_format == "compact":
+            # Nel formato compatto i numeri NON sono nella tabella: evitiamo che un
+            # OCR generale sporco (es. E1=9.584) prevalga sui cartellini a destra.
+            for field in ("e1", "s1", "e2", "s2", "t1", "t2", "t3"):
+                parsed[field] = chart_levels.get(field)
         else:
-            parsed[field] = normalize_level_for_instrument(parsed.get("instrument"), parsed.get(field))
+            # Tabella completa: numeri tabella sono la fonte primaria; scala destra
+            # e OCR generale servono solo se una cella non viene letta.
+            for field in ("e1", "e2", "t1", "t2", "t3"):
+                value = table_data.get(field)
+                if value is not None:
+                    parsed[field] = value
+                elif chart_levels.get(field) is not None:
+                    parsed[field] = chart_levels[field]
+            shared_stop = table_data.get("shared_stop")
+            if shared_stop is not None:
+                parsed["s1"] = shared_stop
+                parsed["s2"] = shared_stop
+            else:
+                for field in ("s1", "s2"):
+                    if chart_levels.get(field) is not None:
+                        parsed[field] = chart_levels[field]
+    else:
+        if inferred_direction in {"LONG", "SHORT"} and not parsed.get("direction"):
+            parsed["direction"] = inferred_direction
+        for field, value in chart_levels.items():
+            if value is not None:
+                parsed[field] = value
+
+    for field in ("e1", "s1", "e2", "s2", "t1", "t2", "t3"):
+        parsed[field] = normalize_level_for_instrument(parsed.get("instrument"), parsed.get(field))
 
     return {
         **parsed,
         "full_text": full_text,
         "top_text": top_text,
         "chart_levels": chart_levels,
+        "right_scale_debug": right_debug,
         "table_data": table_data or {},
     }
-
 
 def page_new_signal() -> None:
     if not can_write():
@@ -2540,6 +2902,7 @@ def page_new_signal() -> None:
             if td:
                 st.caption(
                     "Tabella rilevata automaticamente · "
+                    f"Formato: {str(td.get('table_format') or '—').upper()} · "
                     f"X: {', '.join(td.get('checked_rows') or []) or 'nessuna'} · "
                     f"TF: {td.get('setup_timeframe') or '—'}"
                 )
