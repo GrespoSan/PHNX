@@ -21,7 +21,7 @@ import yfinance as yf
 from supabase import create_client, Client
 
 APP_NAME = "G. Signal Tracker"
-APP_VERSION = "V5.6"
+APP_VERSION = "V5.7"
 BUCKET_NAME = "signal-screenshots"
 LOCAL_TZ = ZoneInfo("Europe/Rome")
 
@@ -2444,7 +2444,7 @@ def update_all_open_trades() -> Tuple[int, List[str]]:
 # Monitoraggio target del SEGNALE, indipendente dal trade reale
 # -----------------------------------------------------------------------------
 
-SIGNAL_TARGET_ACTIVE_STATUSES = {"PUBBLICATO", "IN TRADE", "T1 RAGGIUNTO", "T2 RAGGIUNTO"}
+SIGNAL_TARGET_STOP_STATUSES = {"ANNULLATO", "NESSUN TRADE"}
 
 
 def _timestamp_present(value: Any) -> bool:
@@ -2472,6 +2472,54 @@ def _signal_created_datetime(row: Dict[str, Any]) -> Optional[datetime]:
         return None
 
 
+
+def fetch_signal_target_history(ticker: str, start_dt: datetime) -> pd.DataFrame:
+    """Storico robusto per verificare se un target del segnale è stato toccato.
+
+    Per questo scopo non serve il tick/1m: bastano High/Low delle barre 5m/15m/60m.
+    È più leggero e molto più stabile su Yahoo rispetto al 1 minuto.
+    """
+    now = datetime.now(start_dt.tzinfo) if start_dt.tzinfo else datetime.now()
+    age_days = max(0, (now - start_dt).days)
+
+    if age_days <= 58:
+        attempts = [("5m", "60d"), ("15m", "60d"), ("60m", "730d")]
+    elif age_days <= 700:
+        attempts = [("60m", "730d"), ("1d", "max")]
+    else:
+        attempts = [("1d", "max")]
+
+    last_df = pd.DataFrame()
+    for interval, period in attempts:
+        try:
+            df = yf.Ticker(ticker).history(
+                period=period, interval=interval, auto_adjust=False, prepost=True
+            )
+        except Exception:
+            continue
+        if df is None or df.empty:
+            continue
+
+        try:
+            idx = df.index
+            start_cmp = start_dt
+            if idx.tz is not None and start_cmp.tzinfo is None:
+                start_cmp = start_cmp.replace(tzinfo=idx.tz)
+            elif idx.tz is None and start_cmp.tzinfo is not None:
+                start_cmp = start_cmp.replace(tzinfo=None)
+            elif idx.tz is not None and start_cmp.tzinfo is not None:
+                start_cmp = start_cmp.astimezone(idx.tz)
+            df = df[df.index >= start_cmp]
+        except Exception:
+            pass
+
+        if not df.empty:
+            return df
+        last_df = df
+
+    return last_df
+
+
 def evaluate_signal_target_hits(row: Dict[str, Any]) -> Dict[str, Any]:
     """Verifica T1/T2/T3 dal momento di inserimento del segnale.
 
@@ -2483,6 +2531,17 @@ def evaluate_signal_target_hits(row: Dict[str, Any]) -> Dict[str, Any]:
         "signal_t2_hit_time": row.get("signal_t2_hit_time"),
         "signal_t3_hit_time": row.get("signal_t3_hit_time"),
     }
+
+    # Compatibilità/backfill per segnali già esistenti:
+    # se il monitor operativo del trade aveva già registrato il target,
+    # quel target è necessariamente stato raggiunto dopo il salvataggio del segnale.
+    for signal_field, trade_field in (
+        ("signal_t1_hit_time", "t1_hit_time"),
+        ("signal_t2_hit_time", "t2_hit_time"),
+        ("signal_t3_hit_time", "t3_hit_time"),
+    ):
+        if not _timestamp_present(result.get(signal_field)) and _timestamp_present(row.get(trade_field)):
+            result[signal_field] = row.get(trade_field)
 
     direction = str(row.get("direction") or "").upper().strip()
     ticker = effective_yahoo_ticker(row)
@@ -2502,7 +2561,7 @@ def evaluate_signal_target_hits(row: Dict[str, Any]) -> Dict[str, Any]:
     if not unresolved:
         return result
 
-    df, _interval = fetch_intraday(ticker, start_dt)
+    df = fetch_signal_target_history(ticker, start_dt)
     if df.empty:
         return result
 
@@ -2542,7 +2601,10 @@ def update_all_signal_target_hits() -> Tuple[int, List[str]]:
     if df.empty or "status" not in df.columns:
         return 0, []
 
-    active = df[df["status"].isin(SIGNAL_TARGET_ACTIVE_STATUSES)]
+    # Il monitor del SEGNALE è indipendente dal trade reale:
+    # continua anche se il trade è già CHIUSO, finché i target del segnale
+    # non risultano registrati. Si ferma solo per segnali annullati/no-trade.
+    active = df[~df["status"].isin(SIGNAL_TARGET_STOP_STATUSES)]
     checked = 0
     notes: List[str] = []
 
@@ -2550,6 +2612,23 @@ def update_all_signal_target_hits() -> Tuple[int, List[str]]:
         row = load_signal(int(r["id"]))
         if row is None:
             continue
+
+        defined_targets = {
+            "signal_t1_hit_time": _numeric_or_none(signal_level_value(row, "t1")),
+            "signal_t2_hit_time": _numeric_or_none(signal_level_value(row, "t2")),
+            "signal_t3_hit_time": _numeric_or_none(signal_level_value(row, "t3")),
+        }
+        all_known = True
+        for signal_field, target in defined_targets.items():
+            if target is None:
+                continue
+            trade_field = signal_field.replace("signal_", "")
+            if not (_timestamp_present(row.get(signal_field)) or _timestamp_present(row.get(trade_field))):
+                all_known = False
+                break
+        if all_known:
+            continue
+
         try:
             res = evaluate_signal_target_hits(row)
             changes: Dict[str, Any] = {}
@@ -2710,11 +2789,11 @@ def styled_signals_dataframe(df: pd.DataFrame, quotes: Optional[Dict[str, float]
 
         # Target del SEGNALE raggiunti dopo il salvataggio in piattaforma.
         # Sono indipendenti dal trade reale e vengono mostrati SOLO con testo verde.
-        if _timestamp_present(raw.get("signal_t1_hit_time")):
+        if _timestamp_present(raw.get("signal_t1_hit_time")) or _timestamp_present(raw.get("t1_hit_time")):
             set_style("T1", "color: #22c55e; font-weight: 700;")
-        if _timestamp_present(raw.get("signal_t2_hit_time")):
+        if _timestamp_present(raw.get("signal_t2_hit_time")) or _timestamp_present(raw.get("t2_hit_time")):
             set_style("T2", "color: #22c55e; font-weight: 700;")
-        if _timestamp_present(raw.get("signal_t3_hit_time")):
+        if _timestamp_present(raw.get("signal_t3_hit_time")) or _timestamp_present(raw.get("t3_hit_time")):
             set_style("T3", "color: #22c55e; font-weight: 700;")
 
         # Lo Stop reale resta un'informazione esclusivamente operativa.
@@ -3686,7 +3765,7 @@ def page_dashboard() -> None:
         st.success(flash_message)
     if can_write():
         auto_monitor = st.toggle(
-            "Monitoraggio automatico trade aperti (ogni 60 secondi)",
+            "Monitoraggio automatico segnali e trade (ogni 60 secondi)",
             value=True,
             help="Attivo solo mentre questa Dashboard resta aperta. Verifica T1/T2/T3 di tutti i segnali attivi dal momento del salvataggio e, separatamente, T1/T2/T3/Stop dei trade reali.",
         )
