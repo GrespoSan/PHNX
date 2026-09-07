@@ -21,7 +21,7 @@ import yfinance as yf
 from supabase import create_client, Client
 
 APP_NAME = "G. Signal Tracker"
-APP_VERSION = "V5.11"
+APP_VERSION = "V5.12"
 BUCKET_NAME = "signal-screenshots"
 LOCAL_TZ = ZoneInfo("Europe/Rome")
 
@@ -2100,26 +2100,54 @@ def tradingview_chart_url(row: Dict[str, Any]) -> str:
     return f"https://www.tradingview.com/chart/?symbol={quote(symbol, safe='')}" if symbol else ""
 
 @st.cache_data(ttl=55, show_spinner=False)
-def get_current_price(ticker: str) -> Tuple[Optional[float], str]:
+def get_current_quote(ticker: str) -> Tuple[Optional[float], str, Optional[str]]:
+    """Legge il prezzo Yahoo e, quando disponibile, il timestamp reale dell'ultima barra Yahoo.
+
+    Preferisce lo storico intraday 1m, perché consente di distinguere:
+    - ora in cui l'app ha fatto la richiesta;
+    - ora effettiva dell'ultimo dato restituito da Yahoo.
+    """
     if not ticker:
-        return None, "Ticker Yahoo Finance mancante"
+        return None, "Ticker Yahoo Finance mancante", None
+
     try:
         t = yf.Ticker(ticker)
+
+        # Prima scelta: ultimo Close intraday + timestamp reale Yahoo.
+        try:
+            hist = t.history(period="1d", interval="1m", auto_adjust=False, prepost=True)
+            if hist.empty:
+                hist = t.history(period="5d", interval="5m", auto_adjust=False, prepost=True)
+            if not hist.empty:
+                close = hist["Close"].dropna()
+                if not close.empty:
+                    last_idx = close.index[-1]
+                    price = float(close.iloc[-1])
+                    try:
+                        if getattr(last_idx, "tzinfo", None) is not None:
+                            quote_dt = last_idx.to_pydatetime().astimezone(LOCAL_TZ)
+                        else:
+                            quote_dt = last_idx.to_pydatetime().replace(tzinfo=LOCAL_TZ)
+                        quote_time = quote_dt.isoformat(timespec="seconds")
+                    except Exception:
+                        quote_time = str(last_idx)
+                    return price, "Yahoo Finance", quote_time
+        except Exception:
+            pass
+
+        # Fallback: fast_info. Non ha un timestamp affidabile associato al last_price.
         try:
             info = t.fast_info
             p = info.get("last_price") if hasattr(info, "get") else info["last_price"]
             if p is not None and np.isfinite(float(p)):
-                return float(p), "Yahoo Finance"
+                return float(p), "Yahoo Finance", None
         except Exception:
             pass
-        hist = t.history(period="1d", interval="1m", auto_adjust=False, prepost=True)
-        if hist.empty:
-            hist = t.history(period="5d", interval="5m", auto_adjust=False, prepost=True)
-        if not hist.empty:
-            return float(hist["Close"].dropna().iloc[-1]), "Yahoo Finance"
-        return None, "Nessun dato restituito da Yahoo Finance"
+
+        return None, "Nessun dato restituito da Yahoo Finance", None
     except Exception as e:
-        return None, f"Errore Yahoo Finance: {e}"
+        return None, f"Errore Yahoo Finance: {e}", None
+
 
 
 @st.cache_data(ttl=50, show_spinner=False)
@@ -2216,16 +2244,18 @@ def get_market_quote(
 
     if force_refresh:
         try:
-            get_current_price.clear()
+            get_current_quote.clear()
         except Exception:
             pass
 
-    price, source = get_current_price(ticker)
+    price, source, yahoo_time = get_current_quote(ticker)
     if price is not None:
-        _store_market_quote(ticker, price, local_now(), source)
+        # Se Yahoo ci dà il timestamp della barra, salviamo QUELLO.
+        # In caso contrario usiamo l'ora della richiesta come fallback.
+        _store_market_quote(ticker, price, yahoo_time or local_now(), source)
         recent = _recent_market_quote(ticker)
-        return price, source, str(recent.get("time")) if recent else now_iso()
-    return None, source, None
+        return price, source, str(recent.get("time")) if recent else (yahoo_time or now_iso())
+    return None, source, yahoo_time
 
 
 
@@ -2768,7 +2798,27 @@ def dataframe_for_display(df: pd.DataFrame) -> pd.DataFrame:
     })
 
 
-def styled_signals_dataframe(df: pd.DataFrame, quotes: Optional[Dict[str, float]] = None):
+def format_yahoo_quote_time(value: Any) -> str:
+    if not value:
+        return "—"
+    try:
+        ts = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=LOCAL_TZ)
+        else:
+            ts = ts.astimezone(LOCAL_TZ)
+        return ts.strftime("%H:%M:%S")
+    except Exception:
+        try:
+            ts = pd.to_datetime(value, utc=True, errors="coerce")
+            if pd.isna(ts):
+                return "—"
+            return ts.tz_convert(LOCAL_TZ).strftime("%H:%M:%S")
+        except Exception:
+            return "—"
+
+
+def styled_signals_dataframe(df: pd.DataFrame, quotes: Optional[Dict[str, Dict[str, Any]]] = None):
     """Evidenzia livelli raggiunti e aggiunge prezzo/distanza del target attivo sulla stessa riga."""
     display = dataframe_for_display(df)
     if display.empty:
@@ -2776,6 +2826,7 @@ def styled_signals_dataframe(df: pd.DataFrame, quotes: Optional[Dict[str, float]
 
     quotes = quotes or {}
     display["Prezzo attuale"] = "—"
+    display["Ora Yahoo"] = "—"
     display["TradingView"] = ""
     display["Dist. target"] = "—"
 
@@ -2814,21 +2865,24 @@ def styled_signals_dataframe(df: pd.DataFrame, quotes: Optional[Dict[str, float]
         tv_url = tradingview_chart_url(raw)
         if tv_url:
             display.at[idx, "TradingView"] = tv_url
-        price = quotes.get(ticker) if ticker else None
+        quote_info = quotes.get(ticker) if ticker else None
+        price = quote_info.get("price") if isinstance(quote_info, dict) else None
+        quote_time = quote_info.get("time") if isinstance(quote_info, dict) else None
         if price is not None:
-            # Il prezzo corrente è utile anche quando il segnale è ancora IDEA / IN ATTESA.
+            # Prezzo Yahoo + ora effettiva dell'ultimo dato restituito da Yahoo.
             display.at[idx, "Prezzo attuale"] = format_market_price(raw, price)
+            display.at[idx, "Ora Yahoo"] = format_yahoo_quote_time(quote_time)
             if status in {"IN TRADE", "T1 RAGGIUNTO", "T2 RAGGIUNTO"}:
                 display.at[idx, "Dist. target"] = format_target_distance(raw, price)
 
     # La distanza resta vicino allo Stato; prezzo attuale e collegamento TradingView
     # vengono messi alla fine, uno accanto all'altro.
     ordered = list(display.columns)
-    for col in ["Prezzo attuale", "TradingView", "Dist. target"]:
+    for col in ["Prezzo attuale", "Ora Yahoo", "TradingView", "Dist. target"]:
         ordered.remove(col)
     insert_at = ordered.index("Stato") if "Stato" in ordered else len(ordered)
     ordered.insert(insert_at, "Dist. target")
-    ordered.extend(["Prezzo attuale", "TradingView"])
+    ordered.extend(["Prezzo attuale", "Ora Yahoo", "TradingView"])
     display = display[ordered]
 
     def style_row(row: pd.Series) -> List[str]:
@@ -2890,9 +2944,9 @@ def dashboard_quotes(
     df: pd.DataFrame,
     allow_fetch: bool,
     force_refresh: bool = False,
-) -> Dict[str, float]:
-    """Prezzi per tutti i segnali ancora attivi: idea e trade aperti."""
-    quotes: Dict[str, float] = {}
+) -> Dict[str, Dict[str, Any]]:
+    """Prezzi Yahoo per i segnali attivi, con timestamp effettivo dell'ultimo dato disponibile."""
+    quotes: Dict[str, Dict[str, Any]] = {}
     if df.empty:
         return quotes
     active_statuses = {"PUBBLICATO", "IN TRADE", "T1 RAGGIUNTO", "T2 RAGGIUNTO"}
@@ -2907,9 +2961,17 @@ def dashboard_quotes(
             tickers.append(ticker)
 
     for ticker in tickers:
-        price, _, _ = get_market_quote(ticker, allow_fetch=allow_fetch, force_refresh=force_refresh)
+        price, source, quote_time = get_market_quote(
+            ticker,
+            allow_fetch=allow_fetch,
+            force_refresh=force_refresh,
+        )
         if price is not None:
-            quotes[ticker] = float(price)
+            quotes[ticker] = {
+                "price": float(price),
+                "time": quote_time,
+                "source": source,
+            }
     return quotes
 
 
@@ -3687,7 +3749,7 @@ def _optional_path(value: Any) -> str:
     return "" if s.lower() in {"", "none", "nan", "nat"} else s
 
 
-def dashboard_signal_detail(row: Dict[str, Any], quotes: Dict[str, float]) -> None:
+def dashboard_signal_detail(row: Dict[str, Any], quotes: Dict[str, Dict[str, Any]]) -> None:
     """Apre sotto la tabella il dettaglio completo quando si clicca la cella ID."""
     sid = int(row["id"])
     instrument = canonical_instrument_label(row.get("instrument"))
@@ -3726,7 +3788,8 @@ def dashboard_signal_detail(row: Dict[str, Any], quotes: Dict[str, float]) -> No
         final_screenshot_button(row, key=f"dashboard_detail_final_{sid}", use_container_width=False)
 
     ticker = effective_yahoo_ticker(row)
-    price = quotes.get(ticker) if ticker else None
+    quote_info = quotes.get(ticker) if ticker else None
+    price = quote_info.get("price") if isinstance(quote_info, dict) else None
     state = open_trade_status_label(row)
     if state == "PUBBLICATO":
         state = operational_status_label(state)
