@@ -21,7 +21,7 @@ import yfinance as yf
 from supabase import create_client, Client
 
 APP_NAME = "G. Signal Tracker"
-APP_VERSION = "V5.10"
+APP_VERSION = "V5.11"
 BUCKET_NAME = "signal-screenshots"
 LOCAL_TZ = ZoneInfo("Europe/Rome")
 
@@ -3819,11 +3819,11 @@ def dashboard_live_panel(auto_monitor: bool) -> None:
         hide_index=True,
         key=f"dashboard_signals_table_{int(st.session_state.get('dashboard_table_version', 0))}",
         on_select="rerun",
-        selection_mode="single-cell",
+        selection_mode="single-row",
         column_config={
             "ID": st.column_config.NumberColumn(
                 "ID",
-                help="Clicca sull'ID per aprire il dettaglio completo sotto la tabella",
+                help="Seleziona il quadratino a sinistra per aprire il dettaglio completo sotto la tabella",
                 width="small",
             ),
             "TradingView": st.column_config.LinkColumn(
@@ -3835,22 +3835,21 @@ def dashboard_live_panel(auto_monitor: bool) -> None:
         },
     )
 
-    selected_cells = []
+    selected_rows = []
     try:
-        selected_cells = list(table_event.selection.cells)
+        selected_rows = list(table_event.selection.rows)
     except Exception:
         try:
-            selected_cells = list(table_event.get("selection", {}).get("cells", []))
+            selected_rows = list(table_event.get("selection", {}).get("rows", []))
         except Exception:
-            selected_cells = []
+            selected_rows = []
 
-    if selected_cells:
+    if selected_rows:
         try:
-            pos, column_name = selected_cells[0]
-            pos = int(pos)
+            pos = int(selected_rows[0])
         except Exception:
-            pos, column_name = -1, ""
-        if column_name == "ID" and 0 <= pos < len(df):
+            pos = -1
+        if 0 <= pos < len(df):
             st.session_state["dashboard_selected_signal_id"] = int(df.iloc[pos]["id"])
 
     selected_sid = st.session_state.get("dashboard_selected_signal_id")
