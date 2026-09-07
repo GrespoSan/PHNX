@@ -6,6 +6,7 @@ import hmac
 import re
 import shutil
 from datetime import datetime, date, timedelta
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple
 from urllib.parse import quote
@@ -20,7 +21,7 @@ import yfinance as yf
 from supabase import create_client, Client
 
 APP_NAME = "G. Signal Tracker"
-APP_VERSION = "V5.4"
+APP_VERSION = "V5.5"
 BUCKET_NAME = "signal-screenshots"
 LOCAL_TZ = ZoneInfo("Europe/Rome")
 
@@ -2183,14 +2184,25 @@ def market_price_decimals(row: Dict[str, Any], current_price: Optional[float] = 
     - Gold / indici -> normalmente 1-2 decimali
     """
     candidates = [
-        current_price,
         row.get("e1"), row.get("e2"), row.get("s1"), row.get("s2"),
         row.get("t1"), row.get("t2"), row.get("t3"),
         row.get("actual_entry"), row.get("actual_stop"),
     ]
     precision = max((_value_decimal_places(v) for v in candidates), default=0)
-    # Evita una falsa precisione eccessiva, ma non tronca strumenti come FX/Treasury.
-    return max(1, min(5, precision))
+
+    # Se non abbiamo ancora livelli utili, usa una precisione prudente.
+    if precision <= 0:
+        ticker = str(row.get("ticker") or "").upper()
+        instrument = str(row.get("instrument") or "").upper()
+        if any(x in ticker for x in ("6E", "6B", "6A", "6C", "6J", "6S")) or "FRANC" in instrument:
+            precision = 5
+        elif "T-NOTE" in instrument or "TREASURY" in instrument:
+            precision = 4
+        else:
+            precision = 1
+
+    # Mantiene la precisione reale dei livelli senza ereditare i decimali spurii di Yahoo.
+    return max(1, min(6, precision))
 
 
 def format_market_price(row: Dict[str, Any], value: Optional[float]) -> str:
