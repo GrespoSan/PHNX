@@ -21,7 +21,7 @@ import yfinance as yf
 from supabase import create_client, Client
 
 APP_NAME = "G. Signal Tracker"
-APP_VERSION = "V5.16"
+APP_VERSION = "V5.17"
 BUCKET_NAME = "signal-screenshots"
 LOCAL_TZ = ZoneInfo("Europe/Rome")
 
@@ -1976,6 +1976,13 @@ def _edit_signal_body(row: Dict[str, Any], key_prefix: str) -> None:
                     st.session_state.pop("dashboard_selected_signal_id", None)
                 else:
                     st.session_state["dashboard_selected_signal_id"] = sid
+            elif str(key_prefix).startswith("archive"):
+                st.session_state["edit_flash_message"] = success_message
+                st.session_state["archive_table_version"] = int(st.session_state.get("archive_table_version", 0)) + 1
+                if save_edit_close:
+                    st.session_state.pop("archive_selected_signal_id", None)
+                else:
+                    st.session_state["archive_selected_signal_id"] = sid
             else:
                 st.session_state["edit_flash_message"] = success_message
             st.rerun()
@@ -3787,6 +3794,9 @@ def render_saved_signal_actions(row: Dict[str, Any], key_prefix: str) -> None:
             # Manteniamo aperto il dettaglio Dashboard dopo la rilettura.
             if str(key_prefix).startswith("dashboard_detail_"):
                 st.session_state["dashboard_selected_signal_id"] = sid
+            if str(key_prefix).startswith("archive_detail_"):
+                st.session_state["archive_selected_signal_id"] = sid
+                st.session_state["archive_table_version"] = int(st.session_state.get("archive_table_version", 0)) + 1
             _set_saved_signal_flash(key_prefix, msg)
             st.rerun()
         except Exception as e:
@@ -3801,6 +3811,9 @@ def render_saved_signal_actions(row: Dict[str, Any], key_prefix: str) -> None:
         try:
             delete_signal_with_assets(sid)
             st.session_state.pop("dashboard_selected_signal_id", None)
+            if str(key_prefix).startswith("archive_detail_"):
+                st.session_state.pop("archive_selected_signal_id", None)
+                st.session_state["archive_table_version"] = int(st.session_state.get("archive_table_version", 0)) + 1
             _set_saved_signal_flash(key_prefix, f"Segnale #{sid} eliminato.")
             st.rerun()
         except Exception as e:
@@ -4116,31 +4129,73 @@ def page_archive() -> None:
     if instrument_filter != "TUTTI":
         f = f[f["instrument"] == instrument_filter]
 
-    st.dataframe(dataframe_for_display(f), use_container_width=True, hide_index=True)
-    ids = f["id"].astype(int).tolist()
-    if ids:
-        sid = st.selectbox("Apri dettaglio segnale", ids, format_func=lambda x: f"Segnale #{x}")
-        row = load_signal(int(sid))
-        if row:
-            concluded = trade_is_concluded(row)
-            if concluded:
-                a1, a2 = st.columns(2)
-                with a1:
-                    image_open_button(
-                        row.get("screenshot_path") or "",
-                        f"Segnale #{sid} · {row['instrument']} · {row['direction']} · {row['valid_date']}",
-                        key=f"open_img_archive_{sid}",
-                    )
-                with a2:
-                    final_screenshot_button(row, key=f"final_img_archive_{sid}")
-            else:
-                image_open_button(
-                    row.get("screenshot_path") or "",
-                    f"Segnale #{sid} · {row['instrument']} · {row['direction']} · {row['valid_date']}",
-                    key=f"open_img_archive_{sid}",
-                )
-            render_saved_signal_actions(row, key_prefix=f"archive_detail_{sid}")
-            edit_signal_panel(row, key_prefix="archive")
+    if f.empty:
+        st.info("Nessun segnale trovato con i filtri selezionati.")
+        st.session_state.pop("archive_selected_signal_id", None)
+        return
+
+    st.markdown("**👇 Clicca sul quadratino a sinistra della riga per aprire e modificare il segnale**")
+
+    table_event = st.dataframe(
+        dataframe_for_display(f),
+        use_container_width=True,
+        hide_index=True,
+        key=f"archive_signals_table_{len(f)}_{int(st.session_state.get('archive_table_version', 0))}",
+        on_select="rerun",
+        selection_mode="single-row",
+        column_config={
+            "ID": None,
+        },
+    )
+
+    selected_rows = []
+    try:
+        selected_rows = list(table_event.selection.rows)
+    except Exception:
+        try:
+            selected_rows = list(table_event.get("selection", {}).get("rows", []))
+        except Exception:
+            selected_rows = []
+
+    if selected_rows:
+        try:
+            pos = int(selected_rows[0])
+        except Exception:
+            pos = -1
+        if 0 <= pos < len(f):
+            st.session_state["archive_selected_signal_id"] = int(f.iloc[pos]["id"])
+
+    ids = set(f["id"].astype(int).tolist())
+    selected_sid = st.session_state.get("archive_selected_signal_id")
+    if selected_sid is None or int(selected_sid) not in ids:
+        return
+
+    sid = int(selected_sid)
+    row = load_signal(sid)
+    if not row:
+        st.session_state.pop("archive_selected_signal_id", None)
+        return
+
+    concluded = trade_is_concluded(row)
+    if concluded:
+        a1, a2 = st.columns(2)
+        with a1:
+            image_open_button(
+                row.get("screenshot_path") or "",
+                f"Segnale #{sid} · {row['instrument']} · {row['direction']} · {row['valid_date']}",
+                key=f"open_img_archive_{sid}",
+            )
+        with a2:
+            final_screenshot_button(row, key=f"final_img_archive_{sid}")
+    else:
+        image_open_button(
+            row.get("screenshot_path") or "",
+            f"Segnale #{sid} · {row['instrument']} · {row['direction']} · {row['valid_date']}",
+            key=f"open_img_archive_{sid}",
+        )
+
+    render_saved_signal_actions(row, key_prefix=f"archive_detail_{sid}")
+    edit_signal_panel(row, key_prefix="archive")
 
 
 
