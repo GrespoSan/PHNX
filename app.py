@@ -21,7 +21,7 @@ import yfinance as yf
 from supabase import create_client, Client
 
 APP_NAME = "G. Signal Tracker"
-APP_VERSION = "V5.15"
+APP_VERSION = "V5.16"
 BUCKET_NAME = "signal-screenshots"
 LOCAL_TZ = ZoneInfo("Europe/Rome")
 
@@ -1871,9 +1871,20 @@ def _edit_signal_body(row: Dict[str, Any], key_prefix: str) -> None:
             key=f"{key_prefix}_notes_{sid}",
         )
 
-        save_edit = st.form_submit_button("💾 Salva modifiche", type="primary", use_container_width=True)
+        save_col1, save_col2 = st.columns(2)
+        with save_col1:
+            save_edit = st.form_submit_button(
+                "💾 Salva modifiche",
+                type="primary",
+                use_container_width=True,
+            )
+        with save_col2:
+            save_edit_close = st.form_submit_button(
+                "💾 Salva modifiche e chiudi",
+                use_container_width=True,
+            )
 
-    if save_edit:
+    if save_edit or save_edit_close:
         errors: List[str] = []
         if not instrument_edit.strip():
             errors.append("strumento")
@@ -1961,7 +1972,10 @@ def _edit_signal_body(row: Dict[str, Any], key_prefix: str) -> None:
             if str(key_prefix).startswith("dashboard_detail_"):
                 st.session_state["dashboard_flash_message"] = success_message
                 st.session_state["dashboard_table_version"] = int(st.session_state.get("dashboard_table_version", 0)) + 1
-                st.session_state.pop("dashboard_selected_signal_id", None)
+                if save_edit_close:
+                    st.session_state.pop("dashboard_selected_signal_id", None)
+                else:
+                    st.session_state["dashboard_selected_signal_id"] = sid
             else:
                 st.session_state["edit_flash_message"] = success_message
             st.rerun()
@@ -3932,6 +3946,9 @@ def dashboard_live_panel(auto_monitor: bool) -> None:
         st.warning("\n".join(notes))
 
     quotes = dashboard_quotes(df, allow_fetch=True, force_refresh=manual_update)
+
+    st.markdown("**👇 Clicca sul quadratino a sinistra della riga per aprire e modificare il segnale**")
+
     table_event = st.dataframe(
         styled_signals_dataframe(df, quotes),
         use_container_width=True,
