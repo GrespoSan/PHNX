@@ -21,7 +21,7 @@ import yfinance as yf
 from supabase import create_client, Client
 
 APP_NAME = "G. Signal Tracker"
-APP_VERSION = "V5.18"
+APP_VERSION = "V5.19"
 BUCKET_NAME = "signal-screenshots"
 LOCAL_TZ = ZoneInfo("Europe/Rome")
 
@@ -2973,7 +2973,7 @@ def styled_signals_dataframe(df: pd.DataFrame, quotes: Optional[Dict[str, Dict[s
         ordered.remove(col)
     insert_at = ordered.index("Stato") if "Stato" in ordered else len(ordered)
     ordered.insert(insert_at, "Dist. target")
-    ordered.extend(["Prezzo attuale", "Ora Yahoo", "Età dato", "TradingView", "TV Layout"])
+    ordered.extend(["Prezzo attuale", "Ora Yahoo", "Età dato", "TV Layout", "TradingView"])
     display = display[ordered]
 
     def style_row(row: pd.Series) -> List[str]:
