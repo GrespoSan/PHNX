@@ -21,7 +21,7 @@ import yfinance as yf
 from supabase import create_client, Client
 
 APP_NAME = "G. Signal Tracker"
-APP_VERSION = "V5.17"
+APP_VERSION = "V5.18"
 BUCKET_NAME = "signal-screenshots"
 LOCAL_TZ = ZoneInfo("Europe/Rome")
 
@@ -2120,6 +2120,21 @@ def tradingview_chart_url(row: Dict[str, Any]) -> str:
     symbol = tradingview_symbol(row)
     return f"https://www.tradingview.com/chart/?symbol={quote(symbol, safe='')}" if symbol else ""
 
+
+TRADINGVIEW_SHARED_LAYOUT_URL = "https://it.tradingview.com/chart/SYeTCDZP/"
+
+def tradingview_shared_layout_url(row: Dict[str, Any]) -> str:
+    """Apre il layout condiviso PHNX.
+
+    Manteniamo anche il parametro symbol per verificare se TradingView applica
+    il simbolo del segnale al layout condiviso. Se TradingView lo ignora, il
+    layout si aprirà comunque sul simbolo salvato dal proprietario.
+    """
+    symbol = tradingview_symbol(row)
+    if symbol:
+        return f"{TRADINGVIEW_SHARED_LAYOUT_URL}?symbol={quote(symbol, safe='')}"
+    return TRADINGVIEW_SHARED_LAYOUT_URL
+
 @st.cache_data(ttl=55, show_spinner=False)
 def get_current_quote(ticker: str) -> Tuple[Optional[float], str, Optional[str]]:
     """Legge il prezzo Yahoo e, quando disponibile, il timestamp reale dell'ultima barra Yahoo.
@@ -2899,6 +2914,7 @@ def styled_signals_dataframe(df: pd.DataFrame, quotes: Optional[Dict[str, Dict[s
     display["Ora Yahoo"] = "—"
     display["Età dato"] = "—"
     display["TradingView"] = ""
+    display["TV Layout"] = ""
     display["Dist. target"] = "—"
 
     raw_by_id: Dict[int, Dict[str, Any]] = {}
@@ -2936,6 +2952,9 @@ def styled_signals_dataframe(df: pd.DataFrame, quotes: Optional[Dict[str, Dict[s
         tv_url = tradingview_chart_url(raw)
         if tv_url:
             display.at[idx, "TradingView"] = tv_url
+        tv_layout_url = tradingview_shared_layout_url(raw)
+        if tv_layout_url:
+            display.at[idx, "TV Layout"] = tv_layout_url
         quote_info = quotes.get(ticker) if ticker else None
         price = quote_info.get("price") if isinstance(quote_info, dict) else None
         quote_time = quote_info.get("time") if isinstance(quote_info, dict) else None
@@ -2950,11 +2969,11 @@ def styled_signals_dataframe(df: pd.DataFrame, quotes: Optional[Dict[str, Dict[s
     # La distanza resta vicino allo Stato; prezzo attuale e collegamento TradingView
     # vengono messi alla fine, uno accanto all'altro.
     ordered = list(display.columns)
-    for col in ["Prezzo attuale", "Ora Yahoo", "Età dato", "TradingView", "Dist. target"]:
+    for col in ["Prezzo attuale", "Ora Yahoo", "Età dato", "TradingView", "TV Layout", "Dist. target"]:
         ordered.remove(col)
     insert_at = ordered.index("Stato") if "Stato" in ordered else len(ordered)
     ordered.insert(insert_at, "Dist. target")
-    ordered.extend(["Prezzo attuale", "Ora Yahoo", "Età dato", "TradingView"])
+    ordered.extend(["Prezzo attuale", "Ora Yahoo", "Età dato", "TradingView", "TV Layout"])
     display = display[ordered]
 
     def style_row(row: pd.Series) -> List[str]:
@@ -3976,6 +3995,12 @@ def dashboard_live_panel(auto_monitor: bool) -> None:
             "TradingView": st.column_config.LinkColumn(
                 "TV",
                 help="Apri direttamente il grafico dello strumento su TradingView",
+                display_text="📊 Apri",
+                width="small",
+            ),
+            "TV Layout": st.column_config.LinkColumn(
+                "TV Layout",
+                help="Apri il layout condiviso TradingView SYeTCDZP e prova ad applicare il simbolo del segnale",
                 display_text="📊 Apri",
                 width="small",
             ),
